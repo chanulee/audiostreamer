@@ -10,6 +10,7 @@
 #include "freertos/task.h"
 
 #include "ntp_clock.h"
+#include "spiram_task.h"
 
 static const char *TAG = "ntp_clock";
 
@@ -221,7 +222,7 @@ static void ntp_task(void *pvParameters) {
   }
 
   ntp.task_handle = NULL;
-  vTaskDelete(NULL);
+  task_delete_self_psram();
 }
 
 static bool ntp_wait_for_task_stopped(int timeout_ticks) {
@@ -279,8 +280,9 @@ esp_err_t ntp_clock_start_client(uint32_t remote_ip, uint16_t remote_port) {
   ntp.running = true;
 
   ntp.task_handle = NULL;
-  BaseType_t task_ret = xTaskCreate(ntp_task, "ntp_clock", NTP_STACK_SIZE, NULL,
-                                    5, &ntp.task_handle);
+  BaseType_t task_ret =
+      task_create_psram(ntp_task, "ntp_clock", NTP_STACK_SIZE, NULL, 5,
+                        &ntp.task_handle, tskNO_AFFINITY);
   if (task_ret != pdPASS || ntp.task_handle == NULL) {
     ESP_LOGE(TAG, "Failed to create NTP task");
     close(ntp.socket);

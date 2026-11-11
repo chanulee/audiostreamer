@@ -75,6 +75,8 @@ static volatile bool s_vol_ntf_pending;
 static volatile bool s_claim_pending;
 static uint32_t s_audible_bytes;
 static bool s_primed;
+static volatile uint32_t s_underruns;
+static volatile uint32_t s_dropped;
 static pcm_fifo_t s_fifo;
 static SemaphoreHandle_t s_fifo_lock;
 static TaskHandle_t s_bt_task_handle;
@@ -205,6 +207,8 @@ static void bt_a2dp_data_cb(const uint8_t *data, uint32_t len) {
   // Stereo frames only. Drop whole callbacks rather than replaying old data.
   if (bt_is_source() && len % 4 == 0 && len <= s_fifo.capacity - s_fifo.used) {
     pcm_fifo_write(&s_fifo, data, len);
+  } else if (bt_is_source()) {
+    s_dropped++;
   }
   xSemaphoreGive(s_fifo_lock);
 }
@@ -223,10 +227,33 @@ size_t bt_a2dp_sink_read(int16_t *pcm, size_t max_frames) {
     // Underrun: rebuild the cushion instead of playing every tiny burst.
     if (s_fifo.used == 0) {
       s_primed = false;
+      s_underruns++;
     }
   }
   xSemaphoreGive(s_fifo_lock);
   return bytes / 4;
+}
+
+// Output path behind the A2DP data callback: FIFO prefill, I2S DMA ring
+// (8 x 256 frames, audio_output.c) and one 352-frame playback chunk.
+#define OUTPUT_PIPELINE_FRAMES (8 * 256 + 352)
+
+static uint32_t latency_ms(void) {
+  uint32_t frames = RINGBUF_PREFILL / 4 + OUTPUT_PIPELINE_FRAMES;
+  return frames * 1000 / s_sample_rate;
+}
+
+void bt_a2dp_sink_stats(bt_a2dp_stats_t *stats) {
+  uint32_t used = 0;
+  if (s_fifo_lock) {
+    xSemaphoreTake(s_fifo_lock, portMAX_DELAY);
+    used = s_fifo.used;
+    xSemaphoreGive(s_fifo_lock);
+  }
+  stats->buffer_ms = used / 4 * 1000 / s_sample_rate;
+  stats->latency_ms = latency_ms();
+  stats->underruns = s_underruns;
+  stats->dropped = s_dropped;
 }
 
 uint32_t bt_a2dp_sink_sample_rate(void) {
@@ -263,6 +290,8 @@ static void bt_a2dp_evt_handler(uint16_t event, void *param) {
     } else if (state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
       ESP_LOGI(TAG, "A2DP connected");
       s_connected = true;
+      led_set_pairing(false);
+      led_event(LED_EVENT_OK);
       memcpy(s_peer_bda, a2d->conn_stat.remote_bda, sizeof(s_peer_bda));
 
       clear_pcm();
@@ -332,6 +361,10 @@ static void bt_a2dp_evt_handler(uint16_t event, void *param) {
       }
       ESP_LOGI(TAG, "SBC sample rate: %" PRIu32 " Hz", s_sample_rate);
       // The single output task changes clocks at its next buffer boundary.
+      // AVDTP delay report (0.1 ms units) lets the phone align video.
+      esp_err_t err = esp_a2d_sink_set_delay_value(latency_ms() * 10);
+      ESP_LOGI(TAG, "Delay report: %" PRIu32 " ms (%s)", latency_ms(),
+               esp_err_to_name(err));
     }
     break;
   }

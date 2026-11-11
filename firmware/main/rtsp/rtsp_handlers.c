@@ -35,6 +35,7 @@
 
 #include "rtsp_events.h"
 #include "dacp_client.h"
+#include "spiram_task.h"
 
 static const char *TAG = "rtsp_handlers";
 
@@ -267,7 +268,7 @@ static void event_port_task(void *pvParameters) {
   }
   event_listen_socket = -1;
   event_task_handle = NULL;
-  vTaskDelete(NULL);
+  task_delete_self_psram();
 }
 
 static bool event_port_wait_for_task_stopped(int timeout_ticks) {
@@ -289,8 +290,9 @@ esp_err_t rtsp_start_event_port_task(int listen_socket) {
   event_listen_socket = -1;
   event_task_handle = NULL;
   BaseType_t ret =
-      xTaskCreate(event_port_task, "event_port", EVENT_STACK_SIZE,
-                  (void *)(intptr_t)listen_socket, 5, &event_task_handle);
+      task_create_psram(event_port_task, "event_port", EVENT_STACK_SIZE,
+                        (void *)(intptr_t)listen_socket, 5, &event_task_handle,
+                        tskNO_AFFINITY);
   if (ret != pdPASS) {
     event_task_handle = NULL;
     ESP_LOGE(TAG, "Failed to create event port task");

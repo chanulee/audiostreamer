@@ -34,7 +34,18 @@ esac
 [ -x "$PIO" ] || { echo "No .venv: see README (python3.11 -m venv .venv)"; exit 1; }
 
 echo "== Building firmware $VERSION and web UI"
-"$PIO" run -s -d firmware -e "$ENV"
+# PlatformIO re-runs CMake (which reads version.txt) only when a CMakeLists
+# changes, so a bare version bump would ship the old version string.
+if [ firmware/version.txt -nt "$BUILD/CMakeCache.txt" ]; then
+  touch firmware/CMakeLists.txt
+fi
+# A half-written build folder (e.g. two builds at once) fails with missing
+# generated headers: clean it and build once more before giving up.
+if ! "$PIO" run -s -d firmware -e "$ENV"; then
+  echo "== Build failed; cleaning the build folder and retrying once"
+  rm -rf "$BUILD"
+  "$PIO" run -s -d firmware -e "$ENV"
+fi
 "$PIO" run -s -d firmware -e "$ENV" -t buildfs
 
 # Offsets follow components/boards/partitions.csv.
@@ -84,4 +95,4 @@ run write_flash --flash_mode keep --flash_freq keep --flash_size keep "$@"
 
 echo
 echo "Done. Unplug USB and plug it in again WITHOUT the button to start."
-echo "Log: .venv/bin/pio device monitor -d firmware -p $PORT"
+echo "Log: sh tools/monitor.sh"

@@ -15,6 +15,7 @@
 
 #include "audio_crypto.h"
 #include "network/socket_utils.h"
+#include "spiram_task.h"
 
 #define RTP_HEADER_SIZE          12
 #define AUDIO_RECV_STACK_SIZE    12288
@@ -367,7 +368,7 @@ static void receiver_task(void *pvParameters) {
   if (!packet) {
     ESP_LOGE(TAG, "Failed to allocate receiver packet buffer");
     state->task_handle = NULL;
-    vTaskDelete(NULL);
+    task_delete_self_psram();
     return;
   }
 
@@ -381,7 +382,7 @@ static void receiver_task(void *pvParameters) {
   }
 
   state->task_handle = NULL;
-  vTaskDelete(NULL);
+  task_delete_self_psram();
 }
 
 static uint64_t nctoh64(const uint8_t *data) {
@@ -411,7 +412,7 @@ static void control_receiver_task(void *pvParameters) {
   if (!packet) {
     ESP_LOGE(TAG, "Failed to allocate control packet buffer");
     state->control_task_handle = NULL;
-    vTaskDelete(NULL);
+    task_delete_self_psram();
     return;
   }
   struct sockaddr_in src_addr;
@@ -499,7 +500,7 @@ static void control_receiver_task(void *pvParameters) {
   }
 
   state->control_task_handle = NULL;
-  vTaskDelete(NULL);
+  task_delete_self_psram();
 }
 
 static bool realtime_wait_for_tasks_stopped(audio_receiver_state_t *state,
@@ -551,15 +552,17 @@ static esp_err_t realtime_start(audio_stream_t *stream, uint16_t port) {
 
   stream->running = true;
 
-  ESP_LOGI(TAG, "Free heap: %lu internal (largest block %lu), %lu SPIRAM",
-           (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-           (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+  ESP_LOGI(TAG, "Free heap: %lu DRAM (largest block %lu), %lu SPIRAM",
+           (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL |
+                                                  MALLOC_CAP_8BIT),
+           (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
+                                                           MALLOC_CAP_8BIT),
            (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
   state->task_handle = NULL;
-  BaseType_t task_ret = xTaskCreatePinnedToCore(
-      receiver_task, "audio_recv", AUDIO_RECV_STACK_SIZE, stream, 8,
-      &state->task_handle, AUDIO_TASK_CORE);
+  BaseType_t task_ret =
+      task_create_psram(receiver_task, "audio_recv", AUDIO_RECV_STACK_SIZE,
+                        stream, 8, &state->task_handle, AUDIO_TASK_CORE);
   if (task_ret != pdPASS || !state->task_handle) {
     ESP_LOGE(TAG, "Failed to create receiver task");
     if (state->control_socket > 0) {
@@ -574,9 +577,9 @@ static esp_err_t realtime_start(audio_stream_t *stream, uint16_t port) {
 
   if (state->control_socket > 0) {
     state->control_task_handle = NULL;
-    task_ret = xTaskCreatePinnedToCore(
-        control_receiver_task, "ctrl_recv", AUDIO_CTRL_STACK_SIZE, stream, 7,
-        &state->control_task_handle, AUDIO_TASK_CORE);
+    task_ret = task_create_psram(control_receiver_task, "ctrl_recv",
+                                 AUDIO_CTRL_STACK_SIZE, stream, 7,
+                                 &state->control_task_handle, AUDIO_TASK_CORE);
     if (task_ret != pdPASS || !state->control_task_handle) {
       ESP_LOGE(TAG, "Failed to create control receiver task");
       close(state->control_socket);

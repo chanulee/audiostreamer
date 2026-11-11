@@ -41,3 +41,7 @@ CONFIG_BT_PIN_CODE="0000"
 CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
 CONFIG_ESP32_REV_MIN_3=y
 CONFIG_DEFAULT_AP_SSID="LOVELACE-Setup"
+
+# Internal DRAM is the bottleneck with Wi-Fi + Bluetooth + AirPlay + Spotify:
+# let Wi-Fi and lwIP buffers live in PSRAM so task stacks still fit.
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y

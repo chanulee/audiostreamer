@@ -55,3 +55,27 @@ void wifi_stop(void);
  * Takes effect on the next DHCP transaction.
  */
 void wifi_set_hostname(const char *device_name);
+
+typedef enum {
+  WIFI_SETUP_IDLE,
+  WIFI_SETUP_TESTING,   // joining the new network, setup AP still up
+  WIFI_SETUP_CONNECTED, // joined and saved; setup AP closes shortly
+  WIFI_SETUP_FAILED,    // not saved; previous settings restored
+} wifi_setup_state_t;
+
+typedef struct {
+  wifi_setup_state_t state;
+  char ssid[33];
+  char ip[16];
+  int reason; // last wifi_err_reason_t from the attempt, 0 if none
+} wifi_setup_status_t;
+
+/**
+ * Try new credentials without rebooting. The setup AP stays up during the
+ * attempt; credentials are saved only once the station gets an IP.
+ * @return ESP_ERR_INVALID_STATE while another attempt is running
+ */
+esp_err_t wifi_setup_start(const char *ssid, const char *password);
+
+/** Progress of the last wifi_setup_start(). */
+void wifi_setup_get_status(wifi_setup_status_t *status);

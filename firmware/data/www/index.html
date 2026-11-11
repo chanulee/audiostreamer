@@ -58,6 +58,9 @@ input:focus{outline:none;border-color:#e94560}
 <div class='form-group'><label>Password</label><input type='password' id='wifi-pass' placeholder='Enter password'></div>
 <button class='btn btn-primary btn-block' onclick='saveWiFi()'>Connect to WiFi</button>
 <div id='wifi-msg'></div></div>
+<div class='card'><h2>Spotify Connect</h2>
+<p id='spotify-state' style='color:#888;font-size:13px;margin-bottom:12px'>Client ID / Secret 설정, 계정 연결 상태, 마지막 오류(last_error)</p>
+<a href='/spotify' class='btn btn-primary btn-block'>Spotify 설정 열기</a></div>
 <div class='card'><h2>Device Settings</h2>
 <div class='form-group'><label>AirPlay Device Name</label><input type='text' id='dev-name' placeholder='My Speaker'></div>
 <button class='btn btn-primary' onclick='saveName()'>Save Name</button>
@@ -76,7 +79,6 @@ input:focus{outline:none;border-color:#e94560}
 <option value='3'>Mono (L+R)</option>
 </select></div>
 <div id='chan-msg'></div></div>
-<div id='spotify-link' style='display:none;margin-top:18px'><a href='/spotify' class='btn btn-secondary'>Spotify Connect Settings</a></div>
 </div>
 <div class='card'><h2>Firmware Update</h2>
 <div class='file-row'><input type='file' id='fw-file' accept='.bin' style='display:none'>
@@ -117,17 +119,43 @@ async function scanWiFi(){
   try{var r=await fetch('/api/wifi/scan');var d=await r.json();
     if(d.success&&d.networks.length>0){l.innerHTML='';d.networks.forEach(function(n){
       var i=document.createElement('div');i.className='wifi-item';
-      i.innerHTML='<span class="ssid">'+n.ssid+'</span><span class="rssi">'+n.rssi+' dBm</span>';
+      i.innerHTML='<span class="ssid">'+esc(n.ssid)+'</span><span class="rssi">'+n.rssi+' dBm</span>';
       i.onclick=function(){document.querySelectorAll('.wifi-item').forEach(function(x){x.classList.remove('sel');});i.classList.add('sel');document.getElementById('wifi-ssid').value=n.ssid;};
       l.appendChild(i);});}
     else{l.innerHTML='<div class="msg info">No networks found</div>';}}
   catch(e){l.innerHTML='<div class="msg err">Scan failed</div>';}}
+function stick(id,html,type){document.getElementById(id).innerHTML='<div class="msg '+type+'">'+html+'</div>';}
+function esc(t){var d=document.createElement('div');d.textContent=t;return d.innerHTML;}
+function wifiReason(c){
+  if([2,15,202,204,205].indexOf(c)>=0)return '비밀번호가 맞지 않습니다.';
+  if([201,210,211,212].indexOf(c)>=0)return '네트워크를 찾지 못했습니다. 2.4GHz인지, 너무 멀지 않은지 확인하세요.';
+  return c?'연결하지 못했습니다 (이유 '+c+').':'시간 안에 연결하지 못했습니다.';}
+var wifiPoll=null;
 async function saveWiFi(){
   var s=document.getElementById('wifi-ssid').value.trim();var p=document.getElementById('wifi-pass').value;
   if(!s){msg('wifi-msg','Enter network name','err');return;}
   try{var r=await fetch('/api/wifi/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ssid:s,password:p})});
-    var d=await r.json();if(d.success){msg('wifi-msg','Saved! Restarting...','ok');}else{msg('wifi-msg',d.error,'err');}}
-  catch(e){msg('wifi-msg','Error','err');}}
+    var d=await r.json();if(!d.success){stick('wifi-msg',esc(d.error||'Error'),'err');return;}}
+  catch(e){stick('wifi-msg','보드에 요청을 보내지 못했습니다.','err');return;}
+  stick('wifi-msg','<b>'+esc(s)+'</b>에 연결하는 중... (최대 25초, LED가 빠르게 깜빡입니다)','info');
+  var t0=Date.now();clearInterval(wifiPoll);
+  wifiPoll=setInterval(async function(){
+    try{var r=await fetch('/api/wifi/status',{cache:'no-store'});var st=await r.json();
+      if(st.state==='connected'){clearInterval(wifiPoll);
+        var url='http://'+st.hostname+'.local/';
+        stick('wifi-msg','<b>연결 성공!</b> 집 Wi-Fi 주소: '+esc(st.ip)+'<br>이제 휴대폰/Mac을 집 Wi-Fi로 되돌리고 <a href="http://'+esc(st.ip)+'/"><b>http://'+esc(st.ip)+'/</b></a> 로 접속하세요(북마크 권장). <a href="'+url+'">'+url+'</a> 도 되지만, 공유기 DNS가 .local 이름을 가로채면 열리지 않습니다.<br>이 설정용 Wi-Fi(LOVELACE-Setup)는 2분 뒤 꺼집니다.','ok');}
+      else if(st.state==='failed'){clearInterval(wifiPoll);
+        stick('wifi-msg',wifiReason(st.reason)+' 저장하지 않았습니다. 다시 입력해 주세요.','err');}}
+    catch(e){if(Date.now()-t0>60000){clearInterval(wifiPoll);
+        stick('wifi-msg','보드와의 연결이 끊겼습니다. LED가 2.5초마다 한 번 깜빡이면 성공입니다: 집 Wi-Fi에서 http://lovelace.local/ 을 여세요.','info');}
+      else{stick('wifi-msg','연결 확인 중... (채널이 바뀌며 잠시 끊길 수 있습니다)','info');}}
+  },1000);}
+async function loadSpotify(){
+  try{var r=await fetch('/api/spotify/status');var d=await r.json();
+    var t={needs_configuration:'설정 필요: Client ID / Secret을 입력하세요',waiting_for_login:'Spotify 앱에서 LOVELACE를 선택하세요',connecting:'Spotify 서버에 연결 중',connected:'계정 연결됨',playing:'재생 중',paused:'일시정지',connection_failed:'연결 실패',disabled:'꺼짐 (Spotify 설정에서 켤 수 있음)'}[d.state]||d.state;
+    if(d.last_error)t+=' · 오류: '+esc(d.last_error);
+    document.getElementById('spotify-state').innerHTML='상태: '+t;}
+  catch(e){}}
 async function loadBrightness(){
   try{var r=await fetch('/api/led/brightness');var d=await r.json();
     if(d.success){var s=document.getElementById('led-brightness');s.value=d.brightness;
@@ -184,7 +212,7 @@ async function restart(){
   try{await fetch('/api/system/restart',{method:'POST'});msg('','Restarting...','info');}catch(e){}}
 async function loadInfo(){
   try{var r=await fetch('/api/system/info');var d=await r.json();
-    if(d.success){var i=d.info;document.getElementById('spotify-link').style.display=i.spotify_enabled?'':'none';var b=document.getElementById('status-bar');
+    if(d.success){var i=d.info;var b=document.getElementById('status-bar');
       if(i.wifi_connected){b.className='status-bar ok';b.innerHTML='WiFi: '+i.ip;}
       else{b.className='status-bar err';b.innerHTML='Not connected - Configure WiFi below';}
       document.getElementById('info-ip').textContent=i.ip||'-';
@@ -209,5 +237,5 @@ window.onload=function(){
   document.getElementById('fw-file').onchange=function(e){var f=e.target.files[0];
     document.getElementById('fw-name').textContent=f?f.name:'No file selected';
     document.getElementById('ota-btn').disabled=!f;};
-  loadInfo();loadBrightness();loadChannel();setInterval(loadInfo,30000);};
+  loadInfo();loadBrightness();loadChannel();loadSpotify();setInterval(loadInfo,30000);};
 </script></body></html>

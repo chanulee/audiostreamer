@@ -51,7 +51,10 @@ class AuthChallenges {
   std::vector<uint8_t> shanRecvKey = {};
 
  private:
-  const long long SPOTIFY_VERSION = 0x10800000000;
+  // Desktop client protocol version, as librespot 0.8 reports it. The old
+  // 0x10800000000 dates from libspotify; suspected cause of the BadCredentials
+  // answers seen on 2026-11-11 (unconfirmed).
+  const long long SPOTIFY_VERSION = 124200290;
 
   // Protobuf structures
   ClientResponseEncrypted authRequest;

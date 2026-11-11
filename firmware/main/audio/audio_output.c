@@ -314,6 +314,11 @@ static void playback_task(void *arg) {
       i2s_restart_muted(NULL);
     }
     size_t samples = source_read(source, pcm, FRAME_SAMPLES + 1);
+    // Release before the blocking DMA write: holding the lock across it and
+    // re-taking it at once starved every lower-priority set_source() caller,
+    // so no source could ever take the output. A switch now lands at most
+    // one frame late, and set_source()'s flush restarts the DMA anyway.
+    playback_control_unlock_output();
     if (samples > 0) {
       int16_t *play_buf = pcm;
       size_t play_samples = samples;
@@ -352,8 +357,6 @@ static void playback_task(void *arg) {
 #endif
       }
     }
-    playback_control_unlock_output();
-    taskYIELD();
   }
 
   free(resample_buf);

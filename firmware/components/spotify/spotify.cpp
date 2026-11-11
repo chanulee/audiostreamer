@@ -12,12 +12,14 @@
 #include "nvs.h"
 #include "esp_log.h"
 #include "esp_netif_sntp.h"
+#include "esp_memory_utils.h"
 #include <ctime>
 #include "esp_timer.h"
 #include "freertos/queue.h"
 #include <algorithm>
 #include <atomic>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -26,7 +28,33 @@
 
 static const char *TAG="spotify";
 static const char *NS="spotify";
-static std::string nvs_string(const char *key) {
+
+// The session task's 24 KB stack lives in PSRAM: internal DRAM is too scarce
+// with Wi-Fi + Bluetooth (AirPlay could not start its receiver). Flash access
+// disables the cache, so NVS calls from a PSRAM stack run on this worker.
+struct NvsJob { const std::function<void()> *fn; SemaphoreHandle_t done; };
+static QueueHandle_t nvs_jobs=nullptr;
+static void nvs_worker(void *) {
+    NvsJob job;
+    for (;;) {
+        if (xQueueReceive(nvs_jobs, &job, portMAX_DELAY)==pdTRUE) {
+            (*job.fn)();
+            xSemaphoreGive(job.done);
+        }
+    }
+}
+static void on_internal_stack(const std::function<void()> &fn) {
+    int probe;
+    if (esp_ptr_internal(&probe)) { fn(); return; }
+    SemaphoreHandle_t done=xSemaphoreCreateBinary();
+    if (!done) throw std::bad_alloc();
+    NvsJob job{&fn, done};
+    xQueueSend(nvs_jobs, &job, portMAX_DELAY);
+    xSemaphoreTake(done, portMAX_DELAY);
+    vSemaphoreDelete(done);
+}
+
+static std::string nvs_string_raw(const char *key) {
     nvs_handle_t handle;
     if (nvs_open(NS, NVS_READONLY, &handle)!=ESP_OK) return {};
     size_t size=0;
@@ -37,6 +65,11 @@ static std::string nvs_string(const char *key) {
         else result.resize(size-1);
     }
     nvs_close(handle);
+    return result;
+}
+static std::string nvs_string(const char *key) {
+    std::string result;
+    on_internal_stack([&] { result=nvs_string_raw(key); });
     return result;
 }
 static std::pair<std::string,std::string> app_credentials() {
@@ -51,7 +84,7 @@ static std::pair<std::string,std::string> app_credentials() {
     cJSON_Delete(json);
     return result;
 }
-static esp_err_t save_string(const char *key, const std::string &value) {
+static esp_err_t save_string_raw(const char *key, const std::string &value) {
     nvs_handle_t handle;
     esp_err_t err=nvs_open(NS, NVS_READWRITE, &handle);
     if (err!=ESP_OK) return err;
@@ -60,13 +93,21 @@ static esp_err_t save_string(const char *key, const std::string &value) {
     nvs_close(handle);
     return err;
 }
-static void erase_login() {
+static esp_err_t save_string(const char *key, const std::string &value) {
+    esp_err_t err=ESP_FAIL;
+    on_internal_stack([&] { err=save_string_raw(key, value); });
+    return err;
+}
+static void erase_login_raw() {
     nvs_handle_t handle;
     if (nvs_open(NS, NVS_READWRITE, &handle)==ESP_OK) {
         nvs_erase_key(handle, "credentials");
         nvs_commit(handle);
         nvs_close(handle);
     }
+}
+static void erase_login() {
+    on_internal_stack([] { erase_login_raw(); });
 }
 static esp_err_t http_error(httpd_req_t *r, const char *status, const char *message) {
     httpd_resp_set_status(r, status);
@@ -93,7 +134,7 @@ static esp_err_t send_json(httpd_req_t *r, const std::string &body) {
 class Player : public bell::Task {
 public:
     Player(const char *name, const spotify_callbacks_t &callbacks)
-        : bell::Task("spotify_session", 24*1024, 0, 0, false), name(name), cb(callbacks) {
+        : bell::Task("spotify_session", 24*1024, 0, 0, true), name(name), cb(callbacks) {
         commands=xQueueCreate(8, sizeof(spotify_command_t));
         wake=xSemaphoreCreateBinary();
         if (!commands || !wake) throw std::bad_alloc();
@@ -102,7 +143,11 @@ public:
             if (!saved.empty()) volume=std::clamp(std::stoi(saved), 0, 65535);
         } catch (...) {}
         configured=!app_credentials().first.empty();
+        enabled=nvs_string("enabled")=="1";
     }
+    // Off unless turned on at /spotify: no discovery, no session. A connected
+    // session costs internal DRAM that AirPlay needs for its connection task.
+    bool enabled=false;
     std::atomic<bool> configured{false}, started{false}, connected{false}, paused{true};
     std::atomic<int> volume{32768};
     std::atomic<bool> volume_dirty{false};
@@ -266,8 +311,14 @@ public:
                 ctx->config.audioFormat=AudioFormat_OGG_VORBIS_320;
                 ctx->config.volume=volume;
                 ctx->session->connectWithRandomAp();
+                cspot::setLastError("");
                 ctx->config.authData=ctx->session->authenticate(login);
-                if (ctx->config.authData.empty()) { rejected=true; throw std::runtime_error("Spotify login rejected"); }
+                if (ctx->config.authData.empty()) {
+                    // Session records the AP's decoded reason, if it sent one
+                    rejected=true;
+                    auto reason=cspot::lastError();
+                    throw std::runtime_error(reason.empty() ? "Spotify login rejected" : reason);
+                }
                 if (save_string("credentials", ctx->getCredentialsJson())!=ESP_OK)
                     ESP_LOGW(TAG, "Could not persist reusable login");
                 spirc=std::make_unique<cspot::SpircHandler>(ctx);
@@ -313,6 +364,9 @@ static esp_err_t info_handler(httpd_req_t *r) {
 static esp_err_t login_handler(httpd_req_t *r) {
     try {
         auto form=spotify_parse_form(receive(r, 8192));
+        ESP_LOGI(TAG, "addUser: tokenType=%s blob=%u bytes clientKey=%u bytes",
+                 form["tokenType"].empty() ? "(none)" : form["tokenType"].c_str(),
+                 (unsigned)form["blob"].size(), (unsigned)form["clientKey"].size());
         if (form["action"]!="addUser" || form["userName"].empty() || form["userName"].size()>256 ||
             form["blob"].empty() || form["clientKey"].empty())
             return http_error(r, "400 Bad Request", "invalid addUser request");
@@ -354,11 +408,23 @@ static esp_err_t config_handler(httpd_req_t *r) {
         return send_json(r, "{\"configured\":true,\"restart_required\":true}");
     } catch (...) { return http_error(r, "400 Bad Request", "invalid configuration"); }
 }
+static esp_err_t enabled_handler(httpd_req_t *r) {
+    try {
+        auto form=spotify_parse_form(receive(r, 64));
+        bool on=form["enabled"]=="1";
+        if (!on && form["enabled"]!="0") return http_error(r, "400 Bad Request", "enabled must be 0 or 1");
+        if (save_string("enabled", on ? "1" : "0")!=ESP_OK)
+            return http_error(r, "500 Internal Server Error", "Saving failed");
+        return send_json(r, on ? "{\"enabled\":true,\"restart_required\":true}"
+                               : "{\"enabled\":false,\"restart_required\":true}");
+    } catch (...) { return http_error(r, "400 Bad Request", "invalid request"); }
+}
 static esp_err_t status_handler(httpd_req_t *r) {
     std::lock_guard lock(player->state_mutex);
     cJSON *json=cJSON_CreateObject();
     if (!json) return ESP_ERR_NO_MEM;
     cJSON_AddStringToObject(json, "state", player->state.c_str());
+    cJSON_AddBoolToObject(json, "enabled", player->enabled);
     cJSON_AddBoolToObject(json, "configured", player->configured);
     cJSON_AddBoolToObject(json, "connected", player->connected);
     cJSON_AddBoolToObject(json, "paused", player->paused);
@@ -384,14 +450,18 @@ static esp_err_t page_handler(httpd_req_t *r) {
 <style>body{font:16px system-ui;max-width:600px;margin:40px auto;padding:20px}input,button{padding:10px;margin:8px 0;width:100%;box-sizing:border-box}pre{white-space:pre-wrap}</style>
 <h1>Spotify Connect</h1><p>Spotify 개발자 앱의 Client ID와 Secret을 저장하세요. 저장된 값은 이 화면에 다시 표시하지 않습니다.</p>
 <form id="config"><label>Client ID<input name="client_id" maxlength="32" required autocomplete="off"></label><label>Client Secret<input name="client_secret" type="password" maxlength="32" required autocomplete="off"></label><button>저장</button></form>
-<p id="message"></p><button id="forget">연결된 Spotify 계정 잊기</button><pre id="status"></pre><p><a href="/">기기 설정</a></p>
-<script>const msg=document.querySelector('#message');document.querySelector('#config').onsubmit=async e=>{e.preventDefault();try{let r=await fetch('/api/spotify/config',{method:'POST',body:new URLSearchParams(new FormData(e.target))});if(!r.ok)throw Error(await r.text());e.target.reset();msg.textContent='저장되었습니다. 설정 변경 후 보드를 재부팅하세요.'}catch(e){msg.textContent=e.message}};document.querySelector('#forget').onclick=async()=>{let r=await fetch('/api/spotify/forget',{method:'POST'});msg.textContent=r.ok?'계정 연결 해제 요청 완료. Spotify 앱에서 다시 선택하세요.':'연결 해제 실패'};async function status(){try{let r=await fetch('/api/spotify/status');document.querySelector('#status').textContent=JSON.stringify(await r.json(),null,2)}catch(e){msg.textContent='기기에 연결할 수 없습니다.'}}status();setInterval(status,2000);</script>)HTML";
+<p id="message"></p><button id="toggle">Spotify Connect 끄기/켜기</button><button id="forget">연결된 Spotify 계정 잊기</button><pre id="status"></pre><p><a href="/">기기 설정</a></p>
+<script>const msg=document.querySelector('#message');document.querySelector('#config').onsubmit=async e=>{e.preventDefault();try{let r=await fetch('/api/spotify/config',{method:'POST',body:new URLSearchParams(new FormData(e.target))});if(!r.ok)throw Error(await r.text());e.target.reset();msg.textContent='저장되었습니다. 설정 변경 후 보드를 재부팅하세요.'}catch(e){msg.textContent=e.message}};let enabled=true;document.querySelector('#toggle').onclick=async()=>{let r=await fetch('/api/spotify/enabled',{method:'POST',body:new URLSearchParams({enabled:enabled?'0':'1'})});msg.textContent=r.ok?(enabled?'Spotify Connect를 껐습니다':'Spotify Connect를 켰습니다')+'. 보드를 재부팅하면 적용됩니다.':'변경 실패'};document.querySelector('#forget').onclick=async()=>{let r=await fetch('/api/spotify/forget',{method:'POST'});msg.textContent=r.ok?'계정 연결 해제 요청 완료. Spotify 앱에서 다시 선택하세요.':'연결 해제 실패'};async function status(){try{let r=await fetch('/api/spotify/status');let d=await r.json();enabled=d.enabled;document.querySelector('#toggle').textContent=d.enabled?'Spotify Connect 끄기':'Spotify Connect 켜기';document.querySelector('#status').textContent=JSON.stringify(d,null,2)}catch(e){msg.textContent='기기에 연결할 수 없습니다.'}}status();setInterval(status,2000);</script>)HTML";
     httpd_resp_set_type(r, "text/html; charset=utf-8");
     httpd_resp_set_hdr(r, "Cache-Control", "no-store");
     return httpd_resp_send(r, page, sizeof(page)-1);
 }
 extern "C" esp_err_t spotify_init(const char *name, const spotify_callbacks_t *callbacks) {
     if (player) return ESP_OK;
+    // xTaskCreate keeps this worker's stack in internal RAM
+    nvs_jobs=xQueueCreate(2, sizeof(NvsJob));
+    if (!nvs_jobs || xTaskCreate(nvs_worker, "spotify_nvs", 4096, nullptr, 4, nullptr)!=pdPASS)
+        return ESP_ERR_NO_MEM;
     try { bell::setDefaultLogger(); player=new Player(name, *callbacks); return ESP_OK; }
     catch (...) { return ESP_ERR_NO_MEM; }
 }
@@ -409,6 +479,7 @@ extern "C" esp_err_t spotify_register_http(httpd_handle_t server) {
         make_route("/api/spotify/config", HTTP_POST, config_handler),
         make_route("/api/spotify/status", HTTP_GET, status_handler),
         make_route("/api/spotify/forget", HTTP_POST, forget_handler),
+        make_route("/api/spotify/enabled", HTTP_POST, enabled_handler),
     };
     for (const auto &route : routes) {
         esp_err_t err=httpd_register_uri_handler(server, &route);
@@ -419,6 +490,11 @@ extern "C" esp_err_t spotify_register_http(httpd_handle_t server) {
 extern "C" esp_err_t spotify_start(uint16_t port) {
     if (!player) return ESP_ERR_INVALID_STATE;
     if (player->started.exchange(true)) return ESP_OK;
+    if (!player->enabled) {
+        player->set_state("disabled");
+        ESP_LOGI(TAG, "Spotify Connect is off; turn it on at /spotify");
+        return ESP_OK;
+    }
     mdns_txt_item_t txt[]={ {"VERSION","1.0"}, {"CPath","/spotify_info"}, {"Stack","SP"} };
     esp_err_t err=mdns_service_add(player->name.c_str(), "_spotify-connect", "_tcp", port, txt, 3);
     if (err!=ESP_OK) { player->started=false; return err; }

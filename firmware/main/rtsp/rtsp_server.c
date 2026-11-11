@@ -495,7 +495,12 @@ static void server_task(void *pvParameters) {
         xTaskCreate(client_task, "rtsp_client", CLIENT_STACK_SIZE,
                     (void *)(intptr_t)new_slot, 5, &clients[new_slot].task);
     if (task_ret != pdPASS || clients[new_slot].task == NULL) {
-      ESP_LOGE(TAG, "Failed to create client task");
+      ESP_LOGE(TAG,
+               "Failed to create client task (%d B stack; internal free %u, "
+               "largest block %u)",
+               CLIENT_STACK_SIZE,
+               (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+               (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
       close(new_socket);
       clients[new_slot].socket = -1;
     } else {

@@ -14,6 +14,7 @@
 
 #include "audio_crypto.h"
 #include "network/socket_utils.h"
+#include "spiram_task.h"
 
 #define BUFFERED_AUDIO_PACKET_SIZE 8192
 #define AUDIO_BUFFERED_STACK_SIZE  4096
@@ -172,7 +173,7 @@ static void buffered_audio_task(void *pvParameters) {
   }
 
   state->buffered_task_handle = NULL;
-  vTaskDelete(NULL);
+  task_delete_self_psram();
 }
 
 static bool buffered_wait_for_task_stopped(audio_receiver_state_t *state,
@@ -209,8 +210,9 @@ static esp_err_t buffered_start(audio_stream_t *stream, uint16_t port) {
 
   state->buffered_task_handle = NULL;
   BaseType_t task_ret =
-      xTaskCreate(buffered_audio_task, "buff_audio", AUDIO_BUFFERED_STACK_SIZE,
-                  stream, 5, &state->buffered_task_handle);
+      task_create_psram(buffered_audio_task, "buff_audio",
+                        AUDIO_BUFFERED_STACK_SIZE, stream, 5,
+                        &state->buffered_task_handle, tskNO_AFFINITY);
   if (task_ret != pdPASS || !state->buffered_task_handle) {
     ESP_LOGE(TAG, "Failed to create buffered audio task");
     close(state->buffered_listen_socket);

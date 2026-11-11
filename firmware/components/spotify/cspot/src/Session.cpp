@@ -10,6 +10,7 @@
 
 #include "ApResolve.h"          // for ApResolve, cspot
 #include "AuthChallenges.h"     // for AuthChallenges
+#include "Diagnostics.h"        // for setLastError
 #include "BellLogger.h"         // for AbstractLogger
 #include "Logger.h"             // for CSPOT_LOG
 #include "LoginBlob.h"          // for LoginBlob
@@ -25,6 +26,62 @@ using random_bytes_engine =
     std::independent_bits_engine<std::default_random_engine, CHAR_BIT, uint8_t>;
 
 using namespace cspot;
+
+namespace {
+// APLoginFailed is not in our protos: error_code is field 10 (varint),
+// error_description field 14 (string). Codes follow Spotify's ErrorCode enum.
+const char* loginErrorName(uint32_t code) {
+  switch (code) {
+    case 0x0: return "ProtocolError";
+    case 0x2: return "TryAnotherAP";
+    case 0x5: return "BadConnectionId";
+    case 0x9: return "TravelRestriction";
+    case 0xb: return "PremiumAccountRequired";
+    case 0xc: return "BadCredentials";
+    case 0xd: return "CouldNotValidateCredentials";
+    case 0xe: return "AccountExists";
+    case 0xf: return "ExtraVerificationRequired";
+    case 0x10: return "InvalidAppKey";
+    case 0x11: return "ApplicationBanned";
+    default: return "Unknown";
+  }
+}
+
+bool readVarint(const std::vector<uint8_t>& d, size_t& i, uint64_t& out) {
+  out = 0;
+  for (int shift = 0; i < d.size() && shift < 64; shift += 7) {
+    uint8_t b = d[i++];
+    out |= (uint64_t)(b & 0x7f) << shift;
+    if (!(b & 0x80)) return true;
+  }
+  return false;
+}
+
+std::string describeLoginFailure(const std::vector<uint8_t>& d) {
+  int64_t code = -1;
+  std::string description;
+  size_t i = 0;
+  uint64_t key, value;
+  while (readVarint(d, i, key)) {
+    uint32_t field = key >> 3, wire = key & 7;
+    if (wire == 0) {
+      if (!readVarint(d, i, value)) break;
+      if (field == 10) code = (int64_t)value;
+    } else if (wire == 2) {
+      if (!readVarint(d, i, value) || value > d.size() - i) break;
+      if (field == 14) description.assign(d.begin() + i, d.begin() + i + value);
+      i += value;
+    } else {
+      break;
+    }
+  }
+  std::string text = "Spotify login declined: ";
+  text += code < 0 ? "no error code" : loginErrorName((uint32_t)code);
+  if (code >= 0) text += " (" + std::to_string(code) + ")";
+  if (!description.empty()) text += " - " + description;
+  return text;
+}
+}  // namespace
 
 Session::Session() {
   this->challenges = std::make_unique<cspot::AuthChallenges>();
@@ -92,7 +149,9 @@ std::vector<uint8_t> Session::authenticate(std::shared_ptr<LoginBlob> blob) {
       break;
     }
     case AUTH_DECLINED_COMMAND: {
-      CSPOT_LOG(error, "Authorization declined");
+      auto reason = describeLoginFailure(packet.data);
+      CSPOT_LOG(error, "%s", reason.c_str());
+      setLastError(reason);
       break;
     }
     default:

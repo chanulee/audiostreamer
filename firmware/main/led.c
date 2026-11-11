@@ -104,10 +104,34 @@ static led_mode_t get_rgb_mode_standby(void) {
 #define STATUS_LED_CHANNEL LEDC_CHANNEL_0
 #define STATUS_LED_TIMER   LEDC_TIMER_0
 
+// A pattern alternates on/off durations in ms. Blink modes repeat their
+// pattern; one-shot events play once and then restore the mode underneath.
+typedef struct {
+  const uint16_t *ms;
+  uint8_t len;
+  bool start_on;
+} led_pattern_t;
+
+static const uint16_t P_SLOW[] = {100, 2500};
+static const uint16_t P_MEDIUM[] = {500, 500};
+static const uint16_t P_FAST[] = {250, 250};
+static const uint16_t P_FLICKER[] = {60, 140};
+static const uint16_t P_DOUBLE[] = {80, 150, 80, 1700};
+static const uint16_t P_TRIPLE[] = {80, 120, 80, 120, 80, 1200};
+static const uint16_t P_ACK[] = {120, 120, 120, 120};
+static const uint16_t P_OK[] = {60, 60, 60, 60, 60, 60, 60, 600};
+static const uint16_t P_FAIL[] = {80, 120, 80, 120, 80, 1200,
+                                  80, 120, 80, 120, 80, 1200};
+
+#define PATTERN(a, on) ((led_pattern_t){a, sizeof(a) / sizeof(a[0]), on})
+
 static led_mode_t s_status_mode = LED_OFF;
 static TimerHandle_t s_status_timer = NULL;
 static bool s_status_on = false;
 static uint8_t s_status_duty = CONFIG_LED_STATUS_BRIGHTNESS;
+static led_pattern_t s_pattern;
+static uint8_t s_step;
+static bool s_oneshot = false;
 
 static void status_led_set_duty(uint8_t duty) {
   ledc_set_duty(LEDC_LOW_SPEED_MODE, STATUS_LED_CHANNEL, duty);
@@ -115,36 +139,70 @@ static void status_led_set_duty(uint8_t duty) {
   ESP_LOGV(TAG, "Status LED duty set to %d", duty);
 }
 
+static bool pattern_for_mode(led_mode_t mode, led_pattern_t *out) {
+  switch (mode) {
+  case LED_BLINK_SLOW:
+    *out = PATTERN(P_SLOW, true);
+    return true;
+  case LED_BLINK_MEDIUM:
+    *out = PATTERN(P_MEDIUM, true);
+    return true;
+  case LED_BLINK_FAST:
+    *out = PATTERN(P_FAST, true);
+    return true;
+  case LED_FLICKER:
+    *out = PATTERN(P_FLICKER, true);
+    return true;
+  case LED_DOUBLE:
+    *out = PATTERN(P_DOUBLE, true);
+    return true;
+  case LED_TRIPLE:
+    *out = PATTERN(P_TRIPLE, true);
+    return true;
+  default:
+    return false;
+  }
+}
+
+static void status_led_show_mode(led_mode_t mode);
+
+// Runs on the timer service task, like every other status LED change.
 static void status_timer_cb(TimerHandle_t xTimer) {
   (void)xTimer;
-  s_status_on = !s_status_on;
+  if (s_step >= s_pattern.len) {
+    if (s_oneshot) {
+      s_oneshot = false;
+      status_led_show_mode(s_status_mode);
+      return;
+    }
+    s_step = 0;
+  }
+  s_status_on = ((s_step & 1) == 0) == s_pattern.start_on;
   status_led_set_duty(s_status_on ? s_status_duty : 0);
-  ESP_LOGD(TAG, "Status LED timer: mode=%d, state=%s", s_status_mode,
-           s_status_on ? "ON" : "OFF");
+  TickType_t ticks = pdMS_TO_TICKS(s_pattern.ms[s_step++]);
+  xTimerChangePeriod(s_status_timer, ticks ? ticks : 1, 0);
+}
 
-  uint32_t period_ms;
-  switch (s_status_mode) {
-  case LED_BLINK_SLOW:
-    period_ms = s_status_on ? 100 : 2500;
-    break;
-  case LED_BLINK_MEDIUM:
-    period_ms = 500;
-    break;
-  case LED_BLINK_FAST:
-    period_ms = 250;
-    break;
-  default:
+static void status_led_play(led_pattern_t pattern, bool oneshot) {
+  s_pattern = pattern;
+  s_step = 0;
+  s_oneshot = oneshot;
+  if (s_status_timer) {
+    status_timer_cb(s_status_timer);
+  }
+}
+
+static void status_led_show_mode(led_mode_t mode) {
+  led_pattern_t pattern;
+  if (pattern_for_mode(mode, &pattern)) {
+    status_led_play(pattern, false);
     return;
   }
-
-  TickType_t ticks = pdMS_TO_TICKS(period_ms);
-  if (ticks == 0) {
-    ticks = 1;
+  if (s_status_timer) {
+    xTimerStop(s_status_timer, 0);
   }
-  BaseType_t ret = xTimerChangePeriod(s_status_timer, ticks, 10);
-  if (ret != pdPASS) {
-    ESP_LOGW(TAG, "Failed to change timer period: %d", ret);
-  }
+  s_status_on = mode == LED_STEADY;
+  status_led_set_duty(s_status_on ? s_status_duty : 0);
 }
 
 static void status_led_init(void) {
@@ -197,46 +255,21 @@ static void status_led_set_mode(led_mode_t mode) {
   }
   ESP_LOGD(TAG, "Status LED mode change: %d -> %d", s_status_mode, mode);
   s_status_mode = mode;
-
-  if (s_status_timer && xTimerIsTimerActive(s_status_timer)) {
-    BaseType_t ret = xTimerStop(s_status_timer, 10);
-    if (ret != pdPASS) {
-      ESP_LOGW(TAG, "Failed to stop status LED timer: %d", ret);
-    }
+  if (!s_oneshot) {
+    status_led_show_mode(mode);
   }
+}
 
-  switch (mode) {
-  case LED_OFF:
-    ESP_LOGD(TAG, "Status LED: OFF");
-    status_led_set_duty(0);
+static void status_led_oneshot(led_event_t event) {
+  switch (event) {
+  case LED_EVENT_ACK:
+    status_led_play(PATTERN(P_ACK, false), true);
     break;
-  case LED_STEADY:
-    ESP_LOGD(TAG, "Status LED: STEADY (duty=%d)", s_status_duty);
-    status_led_set_duty(s_status_duty);
+  case LED_EVENT_OK:
+    status_led_play(PATTERN(P_OK, true), true);
     break;
-  case LED_BLINK_SLOW:
-  case LED_BLINK_MEDIUM:
-  case LED_BLINK_FAST:
-    // Reset state and turn LED on for first blink cycle
-    s_status_on =
-        false; // Will be toggled to true immediately in first timer callback
-    if (!s_status_timer) {
-      ESP_LOGE(TAG, "Status LED timer not initialized!");
-      break;
-    }
-    BaseType_t ret = xTimerStart(s_status_timer, 10);
-    if (ret != pdPASS) {
-      ESP_LOGE(TAG, "Failed to start status LED timer: %d", ret);
-    } else {
-      ESP_LOGD(TAG, "Status LED: BLINK mode %d started", mode);
-      // Immediately trigger first state to avoid initial delay
-      status_timer_cb(s_status_timer);
-    }
-    break;
-  case LED_VU:
-    ESP_LOGD(TAG, "Status LED: VU mode (initial OFF)");
-    // Initialize to OFF, will be updated by led_audio_feed()
-    status_led_set_duty(0);
+  case LED_EVENT_FAIL:
+    status_led_play(PATTERN(P_FAIL, true), true);
     break;
   }
 }
@@ -254,6 +287,9 @@ static void status_led_init(void) {
 }
 static void status_led_set_mode(led_mode_t mode) {
   (void)mode;
+}
+static void status_led_oneshot(led_event_t event) {
+  (void)event;
 }
 static void status_led_set_vu(float norm) {
   (void)norm;
@@ -454,6 +490,37 @@ typedef enum {
 
 static led_state_t s_prev_state = STATE_STANDBY;
 static led_state_t s_current_state = STATE_STANDBY;
+static led_network_t s_network = LED_NET_CONNECTING;
+static bool s_pairing = false;
+static TimerHandle_t s_pairing_timer = NULL;
+
+#define PAIRING_TIMEOUT_MS 60000
+
+// Without a phone the LED tells the network story; pairing beats both.
+static led_mode_t status_mode_for(led_state_t state) {
+  if (state == STATE_ERROR) {
+    return LED_TRIPLE;
+  }
+  if (s_pairing && state != STATE_PLAYING) {
+    return LED_BLINK_FAST;
+  }
+  switch (state) {
+  case STATE_PLAYING:
+    return get_status_mode_playing();
+  case STATE_PAUSED:
+    return get_status_mode_paused();
+  default:
+    break;
+  }
+  switch (s_network) {
+  case LED_NET_CONNECTING:
+    return LED_FLICKER;
+  case LED_NET_SETUP:
+    return LED_DOUBLE;
+  default:
+    return get_status_mode_standby();
+  }
+}
 
 static uint8_t scale_bright(uint8_t v) {
   return (uint8_t)((uint16_t)v * s_brightness / 255);
@@ -462,13 +529,11 @@ static uint8_t scale_bright(uint8_t v) {
 static void render_state(led_state_t state) {
   switch (state) {
   case STATE_PLAYING:
-    status_led_set_mode(get_status_mode_playing());
     rgb_led_set_mode(get_rgb_mode_playing());
     error_led_set(false);
     break;
 
   case STATE_PAUSED:
-    status_led_set_mode(get_status_mode_paused());
     rgb_led_set_mode(get_rgb_mode_paused());
     if (get_rgb_mode_paused() == LED_STEADY) {
 #ifdef CONFIG_LED_RGB_COLOR_PAUSED
@@ -483,7 +548,6 @@ static void render_state(led_state_t state) {
     break;
 
   case STATE_STANDBY:
-    status_led_set_mode(get_status_mode_standby());
     rgb_led_set_mode(get_rgb_mode_standby());
     if (get_rgb_mode_standby() == LED_STEADY) {
 #ifdef CONFIG_LED_RGB_COLOR_STANDBY
@@ -498,17 +562,69 @@ static void render_state(led_state_t state) {
     break;
 
   case STATE_ERROR:
-#if CONFIG_LED_ERROR_GPIO >= 0
-    // Dedicated error LED - turn off status to avoid mixed signals
-    status_led_set_mode(LED_OFF);
-#else
-    // No error LED - use status LED to indicate error
-    status_led_set_mode(LED_BLINK_FAST);
-#endif
     rgb_led_set_color(scale_bright(0x80), 0, 0);
     error_led_set(true);
     break;
   }
+#if CONFIG_LED_ERROR_GPIO >= 0
+  // Dedicated error LED - turn off status to avoid mixed signals
+  status_led_set_mode(state == STATE_ERROR ? LED_OFF : status_mode_for(state));
+#else
+  status_led_set_mode(status_mode_for(state));
+#endif
+}
+
+// Every LED change runs on the timer service task, so the Wi-Fi, Bluetooth,
+// button and audio tasks never race on the pattern state.
+static void pended_render(void *arg, uint32_t unused) {
+  (void)arg;
+  (void)unused;
+  render_state(s_current_state);
+}
+
+static void pended_event(void *arg, uint32_t event) {
+  (void)arg;
+  status_led_oneshot((led_event_t)event);
+}
+
+static void request_render(void) {
+  if (xTimerPendFunctionCall(pended_render, NULL, 0, 0) != pdPASS) {
+    ESP_LOGW(TAG, "LED update dropped");
+  }
+}
+
+static void pairing_timeout_cb(TimerHandle_t timer) {
+  (void)timer;
+  s_pairing = false;
+  render_state(s_current_state);
+}
+
+void led_set_network(led_network_t state) {
+  if (state == s_network) {
+    return;
+  }
+  ESP_LOGI(TAG, "LED network state %d -> %d", s_network, state);
+  s_network = state;
+  request_render();
+}
+
+void led_set_pairing(bool pairing) {
+  if (pairing == s_pairing) {
+    return;
+  }
+  s_pairing = pairing;
+  if (s_pairing_timer) {
+    if (pairing) {
+      xTimerReset(s_pairing_timer, 0);
+    } else {
+      xTimerStop(s_pairing_timer, 0);
+    }
+  }
+  request_render();
+}
+
+void led_event(led_event_t event) {
+  xTimerPendFunctionCall(pended_event, NULL, (uint32_t)event, 0);
 }
 
 static void apply_state(led_state_t state) {
@@ -516,7 +632,7 @@ static void apply_state(led_state_t state) {
   s_current_state = state;
 
   ESP_LOGI(TAG, "LED state change: %d -> %d", s_prev_state, state);
-  render_state(state);
+  request_render();
 }
 
 void led_set_playback_status(bool connected, bool playing) {
@@ -631,6 +747,8 @@ void led_init(void) {
   error_led_init();
   rgb_led_init();
 
+  s_pairing_timer = xTimerCreate("led_pair", pdMS_TO_TICKS(PAIRING_TIMEOUT_MS),
+                                 pdFALSE, NULL, pairing_timeout_cb);
   rtsp_events_register(on_rtsp_event, NULL);
 
   // Start in standby
@@ -645,7 +763,7 @@ void led_set_error(bool error) {
     if (s_current_state != STATE_ERROR) {
       apply_state(STATE_ERROR);
     } else {
-      render_state(STATE_ERROR);
+      request_render();
     }
   } else if (s_current_state == STATE_ERROR) {
     apply_state(s_prev_state);
@@ -667,7 +785,7 @@ esp_err_t led_set_brightness(uint8_t brightness) {
   }
 #endif
   // Re-render without changing previous/current state history.
-  render_state(s_current_state);
+  request_render();
   return ESP_OK;
 }
 

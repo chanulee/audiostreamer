@@ -41,8 +41,9 @@ std::vector<uint8_t> AuthChallenges::prepareAuthPacket(
   authRequest.login_credentials.auth_data.size = authData.size();
 
   authRequest.login_credentials.typ = (AuthenticationType)authType;
-  authRequest.system_info.cpu_family = CpuFamily_CPU_UNKNOWN;
-  authRequest.system_info.os = Os_OS_UNKNOWN;
+  // Match the PLATFORM_LINUX_X86 sent in the client hello
+  authRequest.system_info.cpu_family = CpuFamily_CPU_X86;
+  authRequest.system_info.os = Os_OS_LINUX;
 
   auto infoStr = std::string("cspot-player");
   pbPutString(infoStr, authRequest.system_info.system_information_string);

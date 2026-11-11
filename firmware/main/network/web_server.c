@@ -8,12 +8,14 @@
 #include "esp_http_server.h"
 #include "esp_system.h"
 #include "cJSON.h"
+#include <ctype.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <dirent.h>
 
+#include "esp_heap_caps.h"
 #include "esp_wifi.h"
 
 #include "settings.h"
@@ -228,6 +230,40 @@ static esp_err_t wifi_scan_handler(httpd_req_t *req) {
   return ESP_OK;
 }
 
+static esp_err_t wifi_status_handler(httpd_req_t *req) {
+  static const char *const states[] = {"idle", "testing", "connected",
+                                       "failed"};
+  wifi_setup_status_t st;
+  wifi_setup_get_status(&st);
+  char name[65];
+  char host[40];
+  settings_get_device_name(name, sizeof(name));
+  settings_device_name_to_hostname(name, host, sizeof(host));
+  for (char *c = host; *c; c++) {
+    *c = (char)tolower((unsigned char)*c);
+  }
+
+  cJSON *json = cJSON_CreateObject();
+  if (!json) {
+    return httpd_resp_send_500(req);
+  }
+  cJSON_AddStringToObject(json, "state", states[st.state]);
+  cJSON_AddStringToObject(json, "ssid", st.ssid);
+  cJSON_AddStringToObject(json, "ip", st.ip);
+  cJSON_AddNumberToObject(json, "reason", st.reason);
+  cJSON_AddStringToObject(json, "hostname", host);
+  char *body = cJSON_PrintUnformatted(json);
+  cJSON_Delete(json);
+  if (!body) {
+    return httpd_resp_send_500(req);
+  }
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  esp_err_t err = httpd_resp_sendstr(req, body);
+  free(body);
+  return err;
+}
+
 static esp_err_t wifi_config_handler(httpd_req_t *req) {
   char content[512];
   int ret = httpd_req_recv(req, content, sizeof(content) - 1);
@@ -253,13 +289,10 @@ static esp_err_t wifi_config_handler(httpd_req_t *req) {
                                ? cJSON_GetStringValue(password_json)
                                : "";
 
-    esp_err_t err = settings_set_wifi_credentials(ssid, password);
+    // Joined and saved in the background; the page polls /api/wifi/status
+    esp_err_t err = wifi_setup_start(ssid, password);
     if (err == ESP_OK) {
       cJSON_AddBoolToObject(response, "success", true);
-      ESP_LOGI(TAG, "WiFi credentials saved. We are restarting...");
-      // Schedule restart
-      vTaskDelay(pdMS_TO_TICKS(1000));
-      esp_restart();
     } else {
       cJSON_AddBoolToObject(response, "success", false);
       cJSON_AddStringToObject(response, "error", esp_err_to_name(err));
@@ -609,6 +642,19 @@ static esp_err_t system_info_handler(httpd_req_t *req) {
   cJSON_AddStringToObject(info, "device_name", device_name);
   cJSON_AddBoolToObject(info, "wifi_connected", wifi_connected);
   cJSON_AddNumberToObject(info, "free_heap", esp_get_free_heap_size());
+  // Task stacks must come from internal RAM: these decide whether one fits
+  cJSON_AddNumberToObject(info, "internal_free",
+                          heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+  cJSON_AddNumberToObject(
+      info, "internal_largest",
+      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+  // Stacks need byte-addressable DRAM; INTERNAL alone also counts IRAM
+  cJSON_AddNumberToObject(
+      info, "dram_free",
+      heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  cJSON_AddNumberToObject(
+      info, "dram_largest",
+      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
   static const char *const source_names[] = {"idle", "airplay", "bluetooth",
                                               "spotify"};
   playback_source_t source = playback_control_get_source();
@@ -617,6 +663,13 @@ static esp_err_t system_info_handler(httpd_req_t *req) {
 #ifdef CONFIG_BT_A2DP_ENABLE
   cJSON_AddBoolToObject(info, "bt_enabled", true);
   cJSON_AddBoolToObject(info, "bt_connected", bt_a2dp_sink_is_connected());
+  bt_a2dp_stats_t bt;
+  bt_a2dp_sink_stats(&bt);
+  cJSON_AddNumberToObject(info, "bt_sample_rate", bt_a2dp_sink_sample_rate());
+  cJSON_AddNumberToObject(info, "bt_buffer_ms", bt.buffer_ms);
+  cJSON_AddNumberToObject(info, "bt_latency_ms", bt.latency_ms);
+  cJSON_AddNumberToObject(info, "bt_underruns", bt.underruns);
+  cJSON_AddNumberToObject(info, "bt_dropped", bt.dropped);
 #else
   cJSON_AddBoolToObject(info, "bt_enabled", false);
 #endif
@@ -883,7 +936,7 @@ esp_err_t web_server_start(uint16_t port) {
 #endif
   config.lru_purge_enable = true; // Reclaim stale sockets when all are in use
   config.max_uri_handlers =
-      30; // Room for captive portal + EQ + speedtest + brightness + channel
+      32; // Room for captive portal + EQ + speedtest + brightness + channel
 #ifdef DAC_HAS_SUB_OFFSET
   config.max_uri_handlers += 2; // sub level get/post
 #endif
@@ -891,7 +944,7 @@ esp_err_t web_server_start(uint16_t port) {
   config.max_uri_handlers += 3;
 #endif
 #ifdef CONFIG_SPOTIFY_ENABLED
-  config.max_uri_handlers += 6;
+  config.max_uri_handlers += 7;
 #endif
   config.max_resp_headers = 8;
   config.stack_size = 8192;
@@ -956,6 +1009,11 @@ esp_err_t web_server_start(uint16_t port) {
                                  .method = HTTP_POST,
                                  .handler = wifi_config_handler};
   httpd_register_uri_handler(s_server, &wifi_config_uri);
+
+  httpd_uri_t wifi_status_uri = {.uri = "/api/wifi/status",
+                                 .method = HTTP_GET,
+                                 .handler = wifi_status_handler};
+  httpd_register_uri_handler(s_server, &wifi_status_uri);
 
   httpd_uri_t device_name_uri = {.uri = "/api/device/name",
                                  .method = HTTP_POST,

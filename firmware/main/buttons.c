@@ -16,6 +16,7 @@
 
 #include "buttons.h"
 #include "audio_output.h"
+#include "led.h"
 #include "playback_control.h"
 #include "spiram_task.h"
 
@@ -79,6 +80,7 @@ static void button_action_task(void *pvParameters) {
   int action;
   while (1) {
     if (xQueueReceive(s_action_queue, &action, portMAX_DELAY) == pdTRUE) {
+      led_event(LED_EVENT_ACK);
       switch ((button_id_t)action) {
       case BTN_PLAY_PAUSE:
         playback_control_play_pause();
@@ -98,6 +100,7 @@ static void button_action_task(void *pvParameters) {
       case BTN_LONG_PRESS:
         // Single-button UI: hold = Bluetooth pairing. Otherwise the timer
         // callback has already powered the board off.
+        led_set_pairing(true);
         playback_control_pairing_mode();
         break;
       case BTN_CHANNEL_CYCLE:

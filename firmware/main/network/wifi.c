@@ -11,8 +11,9 @@
 #include "esp_timer.h"
 #include "nvs_flash.h"
 
-#include "wifi.h"
+#include "led.h"
 #include "settings.h"
+#include "wifi.h"
 
 static const char *TAG = "wifi";
 
@@ -20,6 +21,13 @@ static const char *TAG = "wifi";
 static EventGroupHandle_t s_wifi_event_group;
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
+#define WIFI_TEST_FAIL_BIT BIT2
+
+// Setup test: attempts before giving up, overall limit, and how long the
+// setup AP stays up after success so the page can show the new address
+#define SETUP_ATTEMPTS     3
+#define SETUP_TIMEOUT_MS   25000
+#define SETUP_AP_LINGER_MS 120000
 
 // Re-enable AP after this many consecutive failures
 #define AP_REENABLE_THRESHOLD 5
@@ -36,6 +44,11 @@ static esp_timer_handle_t s_retry_timer = NULL;
 
 // Saved AP config from init, used to re-enable AP without duplication
 static wifi_config_t s_ap_config;
+
+static volatile bool s_setup_active = false;
+static int s_setup_attempts = 0;
+static wifi_setup_status_t s_setup_status = {.state = WIFI_SETUP_IDLE};
+static char s_setup_password[65];
 
 static void wifi_select_best_ap(const char *ssid);
 static void scan_and_connect_task(void *arg);
@@ -102,7 +115,20 @@ static void event_handler(void *arg, esp_event_base_t event_base,
         (wifi_event_sta_disconnected_t *)event_data;
     ESP_LOGI(TAG, "Disconnected from AP, reason: %d", disconnected->reason);
 
+    if (s_setup_active) {
+      // The setup task owns retries while it tests new credentials
+      s_setup_status.reason = disconnected->reason;
+      if (++s_setup_attempts < SETUP_ATTEMPTS) {
+        esp_wifi_connect();
+      } else {
+        xEventGroupSetBits(s_wifi_event_group, WIFI_TEST_FAIL_BIT);
+      }
+      return;
+    }
+
     s_retry_num++;
+    led_set_network(s_retry_num < AP_REENABLE_THRESHOLD ? LED_NET_CONNECTING
+                                                         : LED_NET_SETUP);
 
     if (s_retry_num < AP_REENABLE_THRESHOLD) {
       // Fast retries — reconnect immediately
@@ -127,6 +153,13 @@ static void event_handler(void *arg, esp_event_base_t event_base,
     s_retry_num = 0;
     s_sta_connected = true;
     xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    if (s_setup_active) {
+      // Keep the setup AP: the page there is waiting for this result
+      snprintf(s_setup_status.ip, sizeof(s_setup_status.ip), IPSTR,
+               IP2STR(&event->ip_info.ip));
+      return;
+    }
+    led_set_network(LED_NET_READY);
 
     // Disable AP mode when STA connects
     wifi_mode_t mode;
@@ -344,7 +377,115 @@ void wifi_init_apsta(const char *ap_ssid, const char *ap_password) {
   ESP_LOGI(TAG, "AP+STA mode started: AP SSID=%s", default_ssid);
   if (has_credentials) {
     ESP_LOGI(TAG, "Connecting to WiFi: %s", ssid);
+  } else {
+    led_set_network(LED_NET_SETUP);
   }
+}
+
+static void set_sta_config(const char *ssid, const char *password) {
+  wifi_config_t cfg = {0};
+  strlcpy((char *)cfg.sta.ssid, ssid, sizeof(cfg.sta.ssid));
+  strlcpy((char *)cfg.sta.password, password, sizeof(cfg.sta.password));
+  cfg.sta.threshold.authmode =
+      password[0] ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+  esp_wifi_set_config(WIFI_IF_STA, &cfg);
+  s_bssid_set = false;
+}
+
+static void setup_task(void *arg) {
+  (void)arg;
+  esp_timer_stop(s_retry_timer);
+  enable_ap_mode();
+  xEventGroupClearBits(s_wifi_event_group,
+                       WIFI_CONNECTED_BIT | WIFI_FAIL_BIT | WIFI_TEST_FAIL_BIT);
+  s_setup_attempts = 0;
+  s_setup_active = true;
+  esp_wifi_disconnect();
+  vTaskDelay(pdMS_TO_TICKS(200));
+  set_sta_config(s_setup_status.ssid, s_setup_password);
+  led_set_network(LED_NET_CONNECTING);
+  ESP_LOGI(TAG, "Setup: trying '%s'", s_setup_status.ssid);
+  esp_wifi_connect();
+
+  EventBits_t bits = xEventGroupWaitBits(
+      s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_TEST_FAIL_BIT, pdFALSE,
+      pdFALSE, pdMS_TO_TICKS(SETUP_TIMEOUT_MS));
+
+  if (bits & WIFI_CONNECTED_BIT) {
+    esp_err_t err =
+        settings_set_wifi_credentials(s_setup_status.ssid, s_setup_password);
+    if (err != ESP_OK) {
+      ESP_LOGE(TAG, "Setup: could not save credentials: %s",
+               esp_err_to_name(err));
+    }
+    ESP_LOGI(TAG, "Setup: joined '%s' as %s", s_setup_status.ssid,
+             s_setup_status.ip);
+    s_retry_num = 0;
+    s_setup_status.reason = 0;
+    s_setup_status.state = WIFI_SETUP_CONNECTED;
+    s_setup_active = false;
+    memset(s_setup_password, 0, sizeof(s_setup_password));
+    led_set_network(LED_NET_READY);
+    led_event(LED_EVENT_OK);
+
+    vTaskDelay(pdMS_TO_TICKS(SETUP_AP_LINGER_MS));
+    wifi_mode_t mode;
+    if (s_sta_connected && esp_wifi_get_mode(&mode) == ESP_OK &&
+        mode == WIFI_MODE_APSTA) {
+      ESP_LOGI(TAG, "Setup: closing the setup AP");
+      esp_wifi_set_mode(WIFI_MODE_STA);
+    }
+  } else {
+    ESP_LOGW(TAG, "Setup: '%s' failed, reason %d", s_setup_status.ssid,
+             s_setup_status.reason);
+    s_setup_status.state = WIFI_SETUP_FAILED;
+    memset(s_setup_password, 0, sizeof(s_setup_password));
+    esp_wifi_disconnect();
+    s_setup_active = false;
+    led_event(LED_EVENT_FAIL);
+
+    // Back to the saved network, if any; the setup AP stays up either way
+    char ssid[33] = {0};
+    char password[65] = {0};
+    if (settings_get_wifi_ssid(ssid, sizeof(ssid)) == ESP_OK &&
+        settings_get_wifi_password(password, sizeof(password)) == ESP_OK &&
+        ssid[0]) {
+      set_sta_config(ssid, password);
+      s_retry_num = 0;
+      led_set_network(LED_NET_CONNECTING);
+      esp_wifi_connect();
+    } else {
+      set_sta_config("", "");
+      s_retry_num = AP_REENABLE_THRESHOLD;
+      led_set_network(LED_NET_SETUP);
+    }
+    memset(password, 0, sizeof(password));
+  }
+  vTaskDelete(NULL);
+}
+
+esp_err_t wifi_setup_start(const char *ssid, const char *password) {
+  if (!ssid || !ssid[0] || strlen(ssid) > 32 || !password ||
+      strlen(password) > 64) {
+    return ESP_ERR_INVALID_ARG;
+  }
+  if (s_setup_status.state == WIFI_SETUP_TESTING) {
+    return ESP_ERR_INVALID_STATE;
+  }
+  memset(&s_setup_status, 0, sizeof(s_setup_status));
+  strlcpy(s_setup_status.ssid, ssid, sizeof(s_setup_status.ssid));
+  strlcpy(s_setup_password, password, sizeof(s_setup_password));
+  s_setup_status.state = WIFI_SETUP_TESTING;
+  // Internal-RAM stack: the success path writes NVS (cache disabled)
+  if (xTaskCreate(setup_task, "wifi_setup", 4096, NULL, 4, NULL) != pdPASS) {
+    s_setup_status.state = WIFI_SETUP_IDLE;
+    return ESP_ERR_NO_MEM;
+  }
+  return ESP_OK;
+}
+
+void wifi_setup_get_status(wifi_setup_status_t *status) {
+  *status = s_setup_status;
 }
 
 bool wifi_wait_connected(uint32_t timeout_ms) {

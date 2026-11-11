@@ -18,7 +18,9 @@
  */
 #pragma once
 
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/task.h"
 
 typedef struct {
@@ -51,4 +53,25 @@ task_create_pinned_spiram(TaskFunction_t fn, const char *name, uint32_t depth,
 
 static inline void task_free_spiram(spiram_task_mem_t *mem) {
   (void)mem;
+}
+
+/*
+ * AirPlay session tasks (receiver, control, timing, event port) never touch
+ * flash, so their stacks can live in PSRAM. With Wi-Fi + Bluetooth up only
+ * ~20 KB of byte-addressable internal RAM is left, too little for them.
+ * A task created this way must exit with task_delete_self_psram(), never
+ * vTaskDelete(NULL), or its stack leaks.
+ */
+static inline BaseType_t task_create_psram(TaskFunction_t fn, const char *name,
+                                           uint32_t depth, void *param,
+                                           UBaseType_t prio,
+                                           TaskHandle_t *handle,
+                                           BaseType_t core) {
+  return xTaskCreatePinnedToCoreWithCaps(fn, name, depth, param, prio, handle,
+                                         core,
+                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+}
+
+static inline void task_delete_self_psram(void) {
+  vTaskDeleteWithCaps(NULL);
 }
