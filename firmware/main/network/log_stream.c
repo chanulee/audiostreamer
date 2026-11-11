@@ -7,6 +7,7 @@
  */
 
 #include "log_stream.h"
+#include "web_server.h"
 #include "spiram_task.h"
 
 #include "esp_heap_caps.h"
@@ -154,7 +155,8 @@ static void broadcast_task(void *arg) {
     int ws_fds[CONFIG_LWIP_MAX_SOCKETS];
     size_t ws_count = 0;
     for (size_t i = 0; i < fd_count; i++) {
-      if (httpd_ws_get_fd_info(s_server, fds[i]) == HTTPD_WS_CLIENT_WEBSOCKET) {
+      if (httpd_ws_get_fd_info(s_server, fds[i]) == HTTPD_WS_CLIENT_WEBSOCKET &&
+          httpd_sess_get_ctx(s_server, fds[i]) != &web_server_nowplaying_tag) {
         ws_fds[ws_count++] = fds[i];
       }
     }

@@ -13,6 +13,7 @@
 #include "led.h"
 #include "playback_control.h"
 #include "rtsp_events.h"
+#include "web_server.h"
 #ifdef CONFIG_SPOTIFY_ENABLED
 #include "spotify_audio.h"
 #endif
@@ -58,6 +59,7 @@ void playback_control_set_source(playback_source_t next) {
   led_set_playback_status(next != PLAYBACK_SOURCE_NONE,
                           next != PLAYBACK_SOURCE_NONE);
   playback_control_unlock_output();
+  web_server_notify_nowplaying(next != PLAYBACK_SOURCE_NONE);
 }
 
 void playback_control_release_source(playback_source_t expected) {
@@ -68,6 +70,7 @@ void playback_control_release_source(playback_source_t expected) {
     led_set_playback_status(false, false);
   }
   playback_control_unlock_output();
+  web_server_notify_nowplaying(false);
 }
 
 void playback_control_set_playing(playback_source_t expected, bool playing) {
@@ -77,6 +80,9 @@ void playback_control_set_playing(playback_source_t expected, bool playing) {
     led_set_playback_status(true, playing);
   }
   playback_control_unlock_output();
+  if (playback_control_get_source() == expected) {
+    web_server_notify_nowplaying(playing);
+  }
 }
 
 static void airplay_event(rtsp_event_t event, const rtsp_event_data_t *data,

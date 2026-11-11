@@ -11,7 +11,7 @@ clang -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined \
 "$build_dir/fifo"
 clang -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined \
   -DCONFIG_SPOTIFY_ENABLED=1 -DCONFIG_BT_A2DP_ENABLE=1 \
-  -I tests/stubs -I firmware/main/audio -I firmware/main/rtsp -I firmware/main \
+  -I tests/stubs -I firmware/main/audio -I firmware/main/rtsp -I firmware/main -I firmware/main/network \
   -I firmware/components/spotify tests/test_spotify_audio.c \
   firmware/main/audio/spotify_audio.c firmware/main/audio/pcm_fifo.c \
   firmware/main/audio/audio_source.c firmware/main/audio/audio_output_common.c -o "$build_dir/arbitration"

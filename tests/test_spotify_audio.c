@@ -18,6 +18,8 @@ static unsigned led_updates;
 void led_set_playback_status(bool connected, bool playing) {
     led_connected=connected; led_playing=playing; led_updates++;
 }
+static unsigned np_pushes;
+void web_server_notify_nowplaying(bool playing) { (void)playing; np_pushes++; }
 void *heap_caps_malloc(size_t bytes, unsigned caps) { (void)caps; return malloc(bytes); }
 SemaphoreHandle_t xSemaphoreCreateMutex(void) { return (void *)1; }
 int xSemaphoreTake(SemaphoreHandle_t h, TickType_t t) { (void)h; (void)t; return 1; }

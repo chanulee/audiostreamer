@@ -25,7 +25,9 @@
 #include "log_stream.h"
 #include "rtsp_server.h"
 #include "audio_output.h"
+#include "freertos/semphr.h"
 #include "playback_control.h"
+#include "rtsp_events.h"
 #ifdef CONFIG_BT_A2DP_ENABLE
 #include "a2dp_sink.h"
 #endif
@@ -920,6 +922,133 @@ static esp_err_t fs_list_handler(httpd_req_t *req) {
 /* ================================================================== */
 
 
+/*  Now playing: last metadata from AirPlay or Bluetooth                */
+/*  GET /api/nowplaying, and pushed on every change to /ws/nowplaying    */
+
+static SemaphoreHandle_t s_np_lock;
+static rtsp_metadata_t s_np;
+static playback_source_t s_np_source = PLAYBACK_SOURCE_NONE;
+static volatile bool s_np_playing;
+static volatile bool s_np_push_queued;
+
+// Marks /ws/nowplaying sessions so log_stream skips them (and we skip its).
+const char web_server_nowplaying_tag = 0;
+
+static char *nowplaying_json(void) {
+  static const char *const names[] = {"idle", "airplay", "bluetooth",
+                                      "spotify"};
+  playback_source_t source = playback_control_get_source();
+  cJSON *json = cJSON_CreateObject();
+  if (!json) {
+    return NULL;
+  }
+  cJSON_AddStringToObject(json, "source",
+                          (unsigned)source < 4 ? names[source] : "idle");
+  cJSON_AddBoolToObject(json, "playing",
+                        source != PLAYBACK_SOURCE_NONE && s_np_playing);
+  xSemaphoreTake(s_np_lock, portMAX_DELAY);
+  // Spotify's track info lives in /api/spotify/status
+  bool match = source != PLAYBACK_SOURCE_NONE && source == s_np_source;
+  cJSON_AddStringToObject(json, "title", match ? s_np.title : "");
+  cJSON_AddStringToObject(json, "artist", match ? s_np.artist : "");
+  cJSON_AddStringToObject(json, "album", match ? s_np.album : "");
+  cJSON_AddNumberToObject(json, "duration_s", match ? s_np.duration_secs : 0);
+  cJSON_AddNumberToObject(json, "position_s", match ? s_np.position_secs : 0);
+  xSemaphoreGive(s_np_lock);
+  char *body = cJSON_PrintUnformatted(json);
+  cJSON_Delete(json);
+  return body;
+}
+
+// Runs on the httpd task (httpd_queue_work), like every other socket write.
+static void nowplaying_push(void *arg) {
+  (void)arg;
+  s_np_push_queued = false;
+  int fds[CONFIG_LWIP_MAX_SOCKETS];
+  size_t count = CONFIG_LWIP_MAX_SOCKETS;
+  if (!s_server || httpd_get_client_list(s_server, &count, fds) != ESP_OK) {
+    return;
+  }
+  char *body = NULL;
+  for (size_t i = 0; i < count; i++) {
+    if (httpd_ws_get_fd_info(s_server, fds[i]) != HTTPD_WS_CLIENT_WEBSOCKET ||
+        httpd_sess_get_ctx(s_server, fds[i]) != &web_server_nowplaying_tag) {
+      continue;
+    }
+    if (!body && !(body = nowplaying_json())) {
+      return;
+    }
+    httpd_ws_frame_t frame = {.type = HTTPD_WS_TYPE_TEXT,
+                              .payload = (uint8_t *)body,
+                              .len = strlen(body)};
+    httpd_ws_send_frame_async(s_server, fds[i], &frame);
+  }
+  free(body);
+}
+
+void web_server_notify_nowplaying(bool playing) {
+  s_np_playing = playing;
+  // One queued push covers a burst of events (metadata arrives per field)
+  if (s_server && !s_np_push_queued) {
+    s_np_push_queued = true;
+    if (httpd_queue_work(s_server, nowplaying_push, NULL) != ESP_OK) {
+      s_np_push_queued = false;
+    }
+  }
+}
+
+// Bluetooth emits metadata only while it owns the output; anything else
+// arriving here is from the AirPlay session.
+static void nowplaying_event(rtsp_event_t event, const rtsp_event_data_t *data,
+                             void *user) {
+  (void)user;
+  if (event != RTSP_EVENT_METADATA || !data || !s_np_lock) {
+    return;
+  }
+  xSemaphoreTake(s_np_lock, portMAX_DELAY);
+  s_np = data->metadata;
+  s_np_source = playback_control_get_source() == PLAYBACK_SOURCE_BLUETOOTH
+                    ? PLAYBACK_SOURCE_BLUETOOTH
+                    : PLAYBACK_SOURCE_AIRPLAY;
+  xSemaphoreGive(s_np_lock);
+  web_server_notify_nowplaying(s_np_playing);
+}
+
+static esp_err_t nowplaying_handler(httpd_req_t *req) {
+  char *body = nowplaying_json();
+  if (!body) {
+    return httpd_resp_send_500(req);
+  }
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  esp_err_t err = httpd_resp_sendstr(req, body);
+  free(body);
+  return err;
+}
+
+static void nowplaying_tag_free(void *ctx) {
+  (void)ctx; // static tag, nothing to free
+}
+
+static esp_err_t ws_nowplaying_handler(httpd_req_t *req) {
+  if (req->method == HTTP_GET) {
+    // Handshake: tag the session and send the current state at once
+    req->sess_ctx = (void *)&web_server_nowplaying_tag;
+    req->free_ctx = nowplaying_tag_free;
+    web_server_notify_nowplaying(s_np_playing);
+    return ESP_OK;
+  }
+  // Receive-only for the page; drain frames (CLOSE etc.) as log_stream does
+  httpd_ws_frame_t frame = {0};
+  if (httpd_ws_recv_frame(req, &frame, 0) == ESP_OK && frame.len > 0 &&
+      frame.len <= 128) {
+    uint8_t buf[128];
+    frame.payload = buf;
+    httpd_ws_recv_frame(req, &frame, sizeof(buf));
+  }
+  return ESP_OK;
+}
+
 esp_err_t web_server_start(uint16_t port) {
   if (s_server) {
     ESP_LOGW(TAG, "Web server already running");
@@ -929,14 +1058,16 @@ esp_err_t web_server_start(uint16_t port) {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = port;
 #ifdef CONFIG_BT_ENABLED
-  config.max_open_sockets = 2;   // BT: tighter socket budget (LWIP 12)
+  // BT: tighter socket budget. One stays open for /ws/nowplaying while
+  // the page is shown; LWIP has 24, lwIP buffers prefer PSRAM.
+  config.max_open_sockets = 3;
   config.send_wait_timeout = 10; // BT/WiFi coexistence slows TCP drain
 #else
   config.max_open_sockets = 3; // Limit to save lwIP socket slots for AirPlay
 #endif
   config.lru_purge_enable = true; // Reclaim stale sockets when all are in use
   config.max_uri_handlers =
-      32; // Room for captive portal + EQ + speedtest + brightness + channel
+      34; // Room for captive portal + EQ + speedtest + brightness + channel
 #ifdef DAC_HAS_SUB_OFFSET
   config.max_uri_handlers += 2; // sub level get/post
 #endif
@@ -1009,6 +1140,20 @@ esp_err_t web_server_start(uint16_t port) {
                                  .method = HTTP_POST,
                                  .handler = wifi_config_handler};
   httpd_register_uri_handler(s_server, &wifi_config_uri);
+
+  if (!s_np_lock) {
+    s_np_lock = xSemaphoreCreateMutex();
+    rtsp_events_register(nowplaying_event, NULL);
+  }
+  httpd_uri_t nowplaying_uri = {.uri = "/api/nowplaying",
+                                .method = HTTP_GET,
+                                .handler = nowplaying_handler};
+  httpd_register_uri_handler(s_server, &nowplaying_uri);
+  httpd_uri_t ws_nowplaying_uri = {.uri = "/ws/nowplaying",
+                                   .method = HTTP_GET,
+                                   .handler = ws_nowplaying_handler,
+                                   .is_websocket = true};
+  httpd_register_uri_handler(s_server, &ws_nowplaying_uri);
 
   httpd_uri_t wifi_status_uri = {.uri = "/api/wifi/status",
                                  .method = HTTP_GET,
