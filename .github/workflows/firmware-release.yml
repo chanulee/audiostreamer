@@ -1,0 +1,69 @@
+# Bump firmware/version.txt on main -> build -> GitHub release fw-v<version>
+# with the OTA image and the full browser-flasher image. A version that
+# already has a release is skipped, so other pushes do nothing.
+name: Firmware release
+
+on:
+  push:
+    branches: [main]
+    paths: [firmware/version.txt]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version
+        id: v
+        run: |
+          v=$(tr -d '[:space:]' < firmware/version.txt)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          if gh release view "fw-v$v" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - uses: actions/setup-python@v5
+        if: steps.v.outputs.exists != 'true'
+        with:
+          python-version: "3.11"
+
+      - name: Cache PlatformIO
+        if: steps.v.outputs.exists != 'true'
+        uses: actions/cache@v4
+        with:
+          path: work/platformio
+          key: pio-${{ hashFiles('firmware/platformio.ini', 'firmware/dependencies.lock') }}
+
+      - name: Build images
+        if: steps.v.outputs.exists != 'true'
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install -q platformio==6.2.0
+          sh tools/flash.sh --image
+
+      - name: Release
+        if: steps.v.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ steps.v.outputs.version }}
+        run: |
+          gh release create "fw-v$V" \
+            "work/flash/lovelace-$V-ota.bin" "work/flash/lovelace-$V-full.bin" \
+            --target "$GITHUB_SHA" --title "Firmware $V (AS-003–AS-008)" \
+            --generate-notes --notes "$(cat <<'EOF'
+          ## 설치
+          - **lovelace-*-ota.bin**: 동작 중인 보드의 웹 UI(`http://<보드 IP>/`) → Firmware Update에 끌어다 놓기. 설정 유지.
+          - **lovelace-*-full.bin**: 첫 설치 / 공장 초기화. Chrome에서 https://espressif.github.io/esptool-js/ → 버튼 누른 채 USB 연결 → 주소 `0x0`. 설정이 지워집니다.
+
+          웹 UI 파일(firmware/data/www)이 바뀐 릴리스는 OTA로 반영되지 않으니 full 이미지나 `sh tools/flash.sh`를 쓰세요. 자세한 방법: docs/FLASHING.md
+
+          비상업적 개인용 프로토타입 펌웨어입니다(docs/UPSTREAM.md).
+          EOF
+          )"
