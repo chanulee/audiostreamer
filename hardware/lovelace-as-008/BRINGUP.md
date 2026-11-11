@@ -57,12 +57,10 @@
 
 1. 버튼(IO0)을 누른 채 USB를 꽂고 놓습니다. CH340N에 DTR이 없어서 자동 다운로드 모드가 없습니다.
 2. 컴퓨터에 CH340 USB 시리얼이 보여야 합니다. 안 보이면 USB D+/D−·USBLC6·CH340N 쪽을 봅니다(바닥 TX/RX 패드로 외부 USB-UART를 대신 연결할 수 있습니다).
-3. 플래시합니다.
+3. 플래시합니다. 첫 보드는 칩 전체를 지우고 펌웨어와 웹 UI를 함께 씁니다([FLASHING.md](../../docs/FLASHING.md), 브라우저 방법도 있음).
 
    ```sh
-   export PLATFORMIO_CORE_DIR="$PWD/work/platformio"
-   .venv/bin/pio run -d firmware -e lovelace-as-004 -t upload
-   .venv/bin/pio run -d firmware -e lovelace-as-004 -t uploadfs
+   sh tools/flash.sh --erase
    ```
 
    펌웨어는 0.3.0 이상(0.3.1부터 환경 이름이 `lovelace-as-004`, 이전 `lovelace-as-003`과 같은 펌웨어)이어야 합니다. `CONFIG_MUTE_GPIO=22`가 들어가기 때문입니다. **이 값이 없는 펌웨어(0.2.x, 옛 `lovelace-as-002` 환경)로는 DAC가 뮤트된 채 남아 소리가 나지 않습니다**(XSMT 풀다운). 웹 UI 정보 화면에서 펌웨어 버전을 확인할 수 있습니다.

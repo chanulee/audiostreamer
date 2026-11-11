@@ -7,6 +7,7 @@
 #include "BellTask.h"
 #include "BellLogger.h"
 #include "LoginBlob.h"
+#include "Diagnostics.h"
 #include "mdns.h"
 #include "nvs.h"
 #include "esp_log.h"
@@ -282,6 +283,7 @@ public:
                 }
             } catch (const std::exception &e) {
                 ESP_LOGE(TAG, "Session failed: %s", e.what());
+                cspot::setLastError(e.what());
                 set_state("connection_failed"); failed=true;
             }
             connected=false; paused=true; cb.end(); reset_audio();
@@ -365,6 +367,7 @@ static esp_err_t status_handler(httpd_req_t *r) {
     cJSON_AddStringToObject(json, "artist", player->artist.c_str());
     cJSON_AddStringToObject(json, "album", player->album.c_str());
     cJSON_AddNumberToObject(json, "duration_ms", player->duration);
+    cJSON_AddStringToObject(json, "last_error", cspot::lastError().c_str());
     char *body=cJSON_PrintUnformatted(json);
     cJSON_Delete(json);
     if (!body) return ESP_ERR_NO_MEM;

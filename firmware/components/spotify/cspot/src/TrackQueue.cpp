@@ -10,6 +10,7 @@
 #include "BellTask.h"
 #include "CDNAudioFile.h"
 #include "CSpotContext.h"
+#include "Diagnostics.h"
 #include "HTTPClient.h"
 #include "Logger.h"
 #include "Utils.h"
@@ -235,6 +236,7 @@ void QueuedTrack::stepParseMetadata(Track* pbTrack, Episode* pbEpisode) {
   // No viable files found for playback
   if (fileId.size() == 0) {
     CSPOT_LOG(info, "File not available for playback");
+    setLastError("Track has no Ogg Vorbis file for this account");
 
     // no alternatives for song
     state = State::FAILED;
@@ -265,7 +267,13 @@ void QueuedTrack::stepLoadAudioFile(
 
           state = State::CDN_REQUIRED;
         } else {
-          CSPOT_LOG(error, "Failed to get audio key");
+          // librespot reports the same refusal as "audio key error 0 1"
+          int code = audioKey.size() >= 6
+                         ? (audioKey[4] << 8 | audioKey[5])
+                         : -1;
+          CSPOT_LOG(error, "Failed to get audio key (code %04x)", code);
+          setLastError(string_format(
+              "Spotify refused the audio key (code %04x)", code));
           state = State::FAILED;
           loadedSemaphore->give();
         }
@@ -313,10 +321,12 @@ void QueuedTrack::stepLoadCDNUrl(const std::string& accessKey) {
 #endif
 
     CSPOT_LOG(info, "Received playable CDN URL");
+    setLastError("");
     state = State::READY;
     loadedSemaphore->give();
   } catch (...) {
     CSPOT_LOG(error, "Cannot fetch CDN URL");
+    setLastError("Spotify storage-resolve failed (token or network)");
     state = State::FAILED;
     loadedSemaphore->give();
   }
@@ -345,6 +355,7 @@ void QueuedTrack::stepLoadMetadata(
 
     if (res.parts.size() == 0) {
       // Invalid metadata, cannot proceed
+      setLastError("Spotify metadata request failed");
       state = State::FAILED;
       updateSemaphore->give();
       loadedSemaphore->give();

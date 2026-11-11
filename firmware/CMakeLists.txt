@@ -4,6 +4,9 @@ cmake_minimum_required(VERSION 3.16)
 # Read firmware version from version.txt
 file(READ "${CMAKE_SOURCE_DIR}/version.txt" PROJECT_VER)
 string(STRIP "${PROJECT_VER}" PROJECT_VER)
+# Re-run CMake when the version changes, or the app keeps the old one
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+             "${CMAKE_SOURCE_DIR}/version.txt")
 
 # Add components directory
 set(EXTRA_COMPONENT_DIRS "${CMAKE_SOURCE_DIR}/components")

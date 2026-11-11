@@ -21,7 +21,7 @@ class AccessKeyFetcher {
   /**
   * @brief Fetches a new access key
   * @remark In case the key is expired, this function blocks until a refresh is done.
-  * @returns access key
+  * @returns access key, or an empty string while a failed refresh backs off
   */
   std::string getAccessKey();
 
@@ -35,6 +35,7 @@ class AccessKeyFetcher {
 
   std::atomic<bool> keyPending = false;
   std::string accessKey;
-  long long int expiresAt;
+  long long int expiresAt = 0;
+  long long int retryAt = 0;
 };
 }  // namespace cspot

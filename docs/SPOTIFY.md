@@ -38,12 +38,12 @@ Client Secret과 재사용 로그인은 이 개발용 보드의 NVS에 저장됩
 | `GET /spotify_info?action=getInfo` | Spotify Zeroconf 기기 정보 |
 | `POST /spotify_info` | Spotify 앱의 form-encoded `addUser` 요청 |
 | `POST /api/spotify/config` | `client_id`, `client_secret` form 저장, 재부팅 후 적용 |
-| `GET /api/spotify/status` | 상태, 계정 연결 여부, 곡 정보·볼륨. Secret은 반환하지 않음 |
+| `GET /api/spotify/status` | 상태, 계정 연결 여부, 곡 정보·볼륨, 마지막 실패 원인(`last_error`). Secret은 반환하지 않음 |
 | `POST /api/spotify/forget` | 계정 로그인만 삭제. 개발자 앱 설정은 유지 |
 
 `needs_configuration`은 개발자 앱 설정이 없는 상태, `waiting_for_login`은 앱의 기기 연결 대기, `connecting`은 서버 인증 중, `connected`는 로그인 완료입니다. `playing`, `paused`, `connection_failed`도 표시합니다. 네트워크 오류는 재시도하며, 계정 인증 거절은 저장된 계정 정보를 지우고 다시 연결을 기다립니다. 다른 계정으로 바꾸려면 설정 화면의 계정 잊기를 먼저 실행하세요.
 
-기기가 안 보이면 같은 LAN인지, 기기 격리와 mDNS 차단이 없는지 확인합니다. 기기는 보이지만 재생하지 못하면 UART 로그에서 인증·토큰·storage-resolve·Vorbis 오류를 확인합니다. 곡 다운로드 주소를 얻는 `storage-resolve`는 비공식 Spotify 내부 인터페이스라 서버 변경이나 개발자 앱 권한에 따라 실패할 수 있습니다. 유효한 Client ID / Secret만으로 실제 곡 재생을 보장할 수는 없습니다.
+`last_error`의 의미와 2025년 말 이후 Spotify의 오디오 키 거부 문제는 [FLASHING.md](FLASHING.md#spotify-토큰과-알려진-위험)에 있습니다. 기기가 안 보이면 같은 LAN인지, 기기 격리와 mDNS 차단이 없는지 확인합니다. 기기는 보이지만 재생하지 못하면 UART 로그에서 인증·토큰·storage-resolve·Vorbis 오류를 확인합니다. 곡 다운로드 주소를 얻는 `storage-resolve`는 비공식 Spotify 내부 인터페이스라 서버 변경이나 개발자 앱 권한에 따라 실패할 수 있습니다. 유효한 Client ID / Secret만으로 실제 곡 재생을 보장할 수는 없습니다.
 
 ## 확인한 범위
 

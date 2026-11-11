@@ -9,6 +9,7 @@
 #include "BellLogger.h"    // for AbstractLogger
 #include "BellUtils.h"     // for BELL_SLEEP_MS
 #include "CSpotContext.h"  // for Context
+#include "Diagnostics.h"   // for setLastError
 #include "HTTPClient.h"
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
@@ -54,7 +55,21 @@ std::string AccessKeyFetcher::getAccessKey() {
     return accessKey;
   }
 
-  updateAccessKey();
+  // Called from the track queue loop every 100 ms: a rejected secret or a
+  // network error must not escape (std::terminate) or hammer the endpoint
+  auto now = ctx->timeProvider->getSyncedTimestamp();
+  if (now < retryAt) {
+    return "";
+  }
+  try {
+    updateAccessKey();
+  } catch (const std::exception& e) {
+    CSPOT_LOG(error, "Access token failed: %s", e.what());
+    setLastError(e.what());
+    accessKey.clear();
+    retryAt = now + 30000;
+    return "";
+  }
 
   return accessKey;
 }
