@@ -838,3 +838,34 @@ settings_set_biamp_eq(const float gains_db[2][2][SETTINGS_WAY_BANDS]) {
   }
   return err;
 }
+
+/* ================================================================== */
+/*  Small options                                                      */
+/* ================================================================== */
+
+uint8_t settings_get_u8(const char *key, uint8_t fallback) {
+  nvs_handle_t nvs;
+  uint8_t value = fallback;
+  if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs) == ESP_OK) {
+    if (nvs_get_u8(nvs, key, &value) != ESP_OK) {
+      value = fallback;
+    }
+    nvs_close(nvs);
+  }
+  return value;
+}
+
+esp_err_t settings_set_u8(const char *key, uint8_t value) {
+  nvs_handle_t nvs;
+  esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
+  if (err != ESP_OK) {
+    return err;
+  }
+  err = nvs_set_u8(nvs, key, value);
+  if (err == ESP_OK) {
+    err = nvs_commit(nvs);
+  }
+  nvs_close(nvs);
+  ESP_LOGI(TAG, "Saved %s = %u (%s)", key, value, esp_err_to_name(err));
+  return err;
+}

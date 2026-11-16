@@ -130,6 +130,14 @@ esp_err_t settings_get_led_brightness(uint8_t *brightness);
  */
 esp_err_t settings_set_led_brightness(uint8_t brightness);
 
+// ---- Noise settings ----
+
+/** Small persisted options; return `fallback` when unset. */
+uint8_t settings_get_u8(const char *key, uint8_t fallback);
+esp_err_t settings_set_u8(const char *key, uint8_t value);
+#define SETTINGS_KEY_DAC_IDLE_MUTE "dac_idle_mute" // 1 = on (default)
+#define SETTINGS_KEY_WIFI_TX_DBM   "wifi_tx_dbm"   // 0 = driver default
+
 // ---- EQ settings ----
 
 /** Number of EQ bands stored in NVS */

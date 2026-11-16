@@ -922,6 +922,79 @@ static esp_err_t fs_list_handler(httpd_req_t *req) {
 /* ================================================================== */
 
 
+/*  Noise: idle DAC mute, Wi-Fi TX cap, timed A/B tests                 */
+
+static esp_err_t noise_get_handler(httpd_req_t *req) {
+  cJSON *json = cJSON_CreateObject();
+  cJSON_AddBoolToObject(json, "idle_mute", audio_output_get_idle_mute());
+  cJSON_AddNumberToObject(json, "wifi_tx_dbm",
+                          settings_get_u8(SETTINGS_KEY_WIFI_TX_DBM, 0));
+  char *body = cJSON_PrintUnformatted(json);
+  cJSON_Delete(json);
+  httpd_resp_set_type(req, "application/json");
+  esp_err_t err = httpd_resp_sendstr(req, body ? body : "{}");
+  free(body);
+  return err;
+}
+
+// {"idle_mute": bool, "wifi_tx_dbm": 0|2..20} saves;
+// {"test": "dac_mute"|"wifi_off", "seconds": 1..60} runs a timed test.
+static esp_err_t noise_post_handler(httpd_req_t *req) {
+  char buf[128];
+  int n = httpd_req_recv(req, buf, sizeof(buf) - 1);
+  if (n <= 0) {
+    return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Empty body");
+  }
+  buf[n] = '\0';
+  cJSON *json = cJSON_Parse(buf);
+  if (!json) {
+    return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+  }
+  esp_err_t err = ESP_OK;
+  cJSON *idle = cJSON_GetObjectItem(json, "idle_mute");
+  cJSON *tx = cJSON_GetObjectItem(json, "wifi_tx_dbm");
+  cJSON *test = cJSON_GetObjectItem(json, "test");
+  cJSON *secs = cJSON_GetObjectItem(json, "seconds");
+  int seconds = cJSON_IsNumber(secs) ? secs->valueint : 15;
+  if (cJSON_IsBool(idle)) {
+    audio_output_set_idle_mute(cJSON_IsTrue(idle));
+    err = settings_set_u8(SETTINGS_KEY_DAC_IDLE_MUTE, cJSON_IsTrue(idle));
+  }
+  if (err == ESP_OK && cJSON_IsNumber(tx)) {
+    int dbm = tx->valueint;
+    err = (dbm == 0 || (dbm >= 2 && dbm <= 20))
+              ? wifi_set_tx_power_dbm((uint8_t)dbm)
+              : ESP_ERR_INVALID_ARG;
+    if (err == ESP_OK) {
+      err = settings_set_u8(SETTINGS_KEY_WIFI_TX_DBM, (uint8_t)dbm);
+    }
+  }
+  bool wifi_off = false;
+  if (err == ESP_OK && cJSON_IsString(test)) {
+    if (seconds < 1 || seconds > 60) {
+      err = ESP_ERR_INVALID_ARG;
+    } else if (!strcmp(test->valuestring, "dac_mute")) {
+      audio_output_test_mute((uint32_t)seconds);
+    } else if (!strcmp(test->valuestring, "wifi_off")) {
+      wifi_off = true; // after the reply, or the page never hears back
+    } else {
+      err = ESP_ERR_INVALID_ARG;
+    }
+  }
+  cJSON_Delete(json);
+  if (err != ESP_OK) {
+    return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                               esp_err_to_name(err));
+  }
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_sendstr(req, "{\"success\":true}");
+  if (wifi_off) {
+    vTaskDelay(pdMS_TO_TICKS(300));
+    wifi_test_off((uint32_t)seconds);
+  }
+  return ESP_OK;
+}
+
 /*  Now playing: last metadata from AirPlay or Bluetooth                */
 /*  GET /api/nowplaying, and pushed on every change to /ws/nowplaying    */
 
@@ -1067,7 +1140,7 @@ esp_err_t web_server_start(uint16_t port) {
 #endif
   config.lru_purge_enable = true; // Reclaim stale sockets when all are in use
   config.max_uri_handlers =
-      34; // Room for captive portal + EQ + speedtest + brightness + channel
+      36; // Room for captive portal + EQ + speedtest + brightness + channel
 #ifdef DAC_HAS_SUB_OFFSET
   config.max_uri_handlers += 2; // sub level get/post
 #endif
@@ -1145,6 +1218,15 @@ esp_err_t web_server_start(uint16_t port) {
     s_np_lock = xSemaphoreCreateMutex();
     rtsp_events_register(nowplaying_event, NULL);
   }
+  httpd_uri_t noise_get_uri = {.uri = "/api/noise",
+                               .method = HTTP_GET,
+                               .handler = noise_get_handler};
+  httpd_register_uri_handler(s_server, &noise_get_uri);
+  httpd_uri_t noise_post_uri = {.uri = "/api/noise",
+                                .method = HTTP_POST,
+                                .handler = noise_post_handler};
+  httpd_register_uri_handler(s_server, &noise_post_uri);
+
   httpd_uri_t nowplaying_uri = {.uri = "/api/nowplaying",
                                 .method = HTTP_GET,
                                 .handler = nowplaying_handler};

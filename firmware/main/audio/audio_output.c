@@ -55,6 +55,10 @@
 #define DAC_MUTE_RAMP_MS 5
 #define DAC_LOCK_MS      20
 
+// Hold the DAC in soft mute after this long without PCM from any source:
+// the analog output then carries no DAC noise while idle.
+#define IDLE_MUTE_US (2 * 1000000LL)
+
 // pdMS_TO_TICKS() truncates (5 ms is 0 ticks at CONFIG_FREERTOS_HZ=100) and a
 // tick delay can end up to one tick early, so round up and add a tick.
 #define TICKS_AT_LEAST_MS(ms) \
@@ -78,6 +82,10 @@ static volatile int source_rate = 44100;
 static uint32_t hardware_rate = OUTPUT_RATE;
 static volatile bool resample_reinit_needed = false;
 static volatile audio_channel_mode_t channel_mode = AUDIO_CHANNEL_STEREO;
+static volatile bool idle_mute_enabled = true;
+static volatile int64_t test_mute_until_us;
+// What the playback task last asked of XSMT outside a clock restart
+static bool dac_held_muted;
 
 /* Live output cursor.  output_submitted_frames advances after a successful
  * i2s_channel_write(); output_sent_frames is advanced by the TX DMA
@@ -164,7 +172,7 @@ static void i2s_restart_muted(const i2s_std_clk_config_t *clk_cfg) {
   output_cursor_reset();
   i2s_channel_enable(tx_handle);
   vTaskDelay(TICKS_AT_LEAST_MS(DAC_LOCK_MS));
-  dac_mute(false);
+  dac_mute(dac_held_muted);
 }
 
 // esp_restart() (OTA, settings) stops the clocks too.
@@ -297,6 +305,7 @@ static void playback_task(void *arg) {
   }
 
   size_t written;
+  int64_t last_audio_us = esp_timer_get_time();
   while (playback_running) {
     playback_control_lock_output();
     playback_source_t source = playback_control_get_source();
@@ -319,6 +328,16 @@ static void playback_task(void *arg) {
     // so no source could ever take the output. A switch now lands at most
     // one frame late, and set_source()'s flush restarts the DMA anyway.
     playback_control_unlock_output();
+    int64_t now = esp_timer_get_time();
+    if (samples > 0) {
+      last_audio_us = now;
+    }
+    bool hold = now < test_mute_until_us ||
+                (idle_mute_enabled && now - last_audio_us > IDLE_MUTE_US);
+    if (hold != dac_held_muted) {
+      dac_held_muted = hold;
+      dac_mute(hold); // XSMT ramps itself while the clocks keep running
+    }
     if (samples > 0) {
       int16_t *play_buf = pcm;
       size_t play_samples = samples;
@@ -602,4 +621,16 @@ void audio_output_set_channel_mode(audio_channel_mode_t mode) {
 
 audio_channel_mode_t audio_output_get_channel_mode(void) {
   return channel_mode;
+}
+
+void audio_output_set_idle_mute(bool enabled) {
+  idle_mute_enabled = enabled;
+}
+
+bool audio_output_get_idle_mute(void) {
+  return idle_mute_enabled;
+}
+
+void audio_output_test_mute(uint32_t seconds) {
+  test_mute_until_us = esp_timer_get_time() + (int64_t)seconds * 1000000;
 }

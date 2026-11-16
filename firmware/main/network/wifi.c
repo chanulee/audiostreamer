@@ -41,6 +41,7 @@ static bool s_wifi_initialized = false;
 static bool s_sta_connected = false;
 static bool s_bssid_set = false;
 static esp_timer_handle_t s_retry_timer = NULL;
+static esp_timer_handle_t s_test_timer = NULL; // wifi_test_off()
 
 // Saved AP config from init, used to re-enable AP without duplication
 static wifi_config_t s_ap_config;
@@ -114,6 +115,10 @@ static void event_handler(void *arg, esp_event_base_t event_base,
     wifi_event_sta_disconnected_t *disconnected =
         (wifi_event_sta_disconnected_t *)event_data;
     ESP_LOGI(TAG, "Disconnected from AP, reason: %d", disconnected->reason);
+
+    if (s_test_timer && esp_timer_is_active(s_test_timer)) {
+      return; // radio stopped on purpose for a noise test
+    }
 
     if (s_setup_active) {
       // The setup task owns retries while it tests new credentials
@@ -373,6 +378,7 @@ void wifi_init_apsta(const char *ap_ssid, const char *ap_password) {
   ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_config));
   ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &s_ap_config));
   ESP_ERROR_CHECK(esp_wifi_start());
+  wifi_set_tx_power_dbm(settings_get_u8(SETTINGS_KEY_WIFI_TX_DBM, 0));
 
   ESP_LOGI(TAG, "AP+STA mode started: AP SSID=%s", default_ssid);
   if (has_credentials) {
@@ -609,4 +615,49 @@ void wifi_stop(void) {
                            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
     }
   }
+}
+
+esp_err_t wifi_set_tx_power_dbm(uint8_t dbm) {
+  if (dbm == 0) {
+    dbm = 20;
+  }
+  if (dbm < 2 || dbm > 20) {
+    return ESP_ERR_INVALID_ARG;
+  }
+  // The driver takes quarter-dBm steps
+  esp_err_t err = esp_wifi_set_max_tx_power((int8_t)(dbm * 4));
+  ESP_LOGI(TAG, "TX power cap %u dBm (%s)", dbm, esp_err_to_name(err));
+  return err;
+}
+
+static void test_restart_cb(void *arg) {
+  (void)arg;
+  ESP_LOGI(TAG, "Noise test over, restarting Wi-Fi");
+  // STA_START reconnects through scan_and_connect_task
+  esp_wifi_start();
+  wifi_set_tx_power_dbm(settings_get_u8(SETTINGS_KEY_WIFI_TX_DBM, 0));
+}
+
+esp_err_t wifi_test_off(uint32_t seconds) {
+  if (seconds == 0 || seconds > 60) {
+    return ESP_ERR_INVALID_ARG;
+  }
+  if (!s_test_timer) {
+    const esp_timer_create_args_t args = {.callback = test_restart_cb,
+                                          .name = "wifi_test"};
+    esp_err_t err = esp_timer_create(&args, &s_test_timer);
+    if (err != ESP_OK) {
+      return err;
+    }
+  }
+  if (esp_timer_is_active(s_test_timer)) {
+    return ESP_ERR_INVALID_STATE;
+  }
+  ESP_LOGI(TAG, "Noise test: Wi-Fi off for %lu s", (unsigned long)seconds);
+  esp_timer_stop(s_retry_timer);
+  esp_err_t err = esp_wifi_stop();
+  if (err == ESP_OK) {
+    err = esp_timer_start_once(s_test_timer, (uint64_t)seconds * 1000000);
+  }
+  return err;
 }

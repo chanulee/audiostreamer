@@ -51,6 +51,13 @@ void audio_output_start(void);
  */
 void audio_output_flush(void);
 
+/** Soft-mute the DAC after 2 s without audio (default on). */
+void audio_output_set_idle_mute(bool enabled);
+bool audio_output_get_idle_mute(void);
+
+/** Hold the DAC muted for a noise test, whatever plays (0 ends it). */
+void audio_output_test_mute(uint32_t seconds);
+
 /** Flush an AirPlay session without interrupting another selected source. */
 void audio_output_flush_airplay(void);
 

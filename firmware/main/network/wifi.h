@@ -79,3 +79,12 @@ esp_err_t wifi_setup_start(const char *ssid, const char *password);
 
 /** Progress of the last wifi_setup_start(). */
 void wifi_setup_get_status(wifi_setup_status_t *status);
+
+/**
+ * Cap the radio's transmit power (dBm, 2..20; 0 = driver default, about
+ * 20 dBm). Less TX power means smaller current pulses on the board ground.
+ */
+esp_err_t wifi_set_tx_power_dbm(uint8_t dbm);
+
+/** Stop the Wi-Fi radio for a noise test and restart it after `seconds`. */
+esp_err_t wifi_test_off(uint32_t seconds);

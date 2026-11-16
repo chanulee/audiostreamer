@@ -133,6 +133,8 @@ void app_main(void) {
 
   ESP_ERROR_CHECK(audio_receiver_init());
   ESP_ERROR_CHECK(audio_output_init());
+  audio_output_set_idle_mute(
+      settings_get_u8(SETTINGS_KEY_DAC_IDLE_MUTE, 1) != 0);
   audio_output_start();
 
 #ifdef CONFIG_BT_A2DP_ENABLE
